@@ -8,13 +8,16 @@
   "liquidityLocker": "0x6232e26bEa0283d15dFde673ADA0cc993bC7B90F",
   "otc": "0x76B480be19abe121907Aaa5028F52462C8F2F8b5",
   "ethRouter": "0x04231d4EBa71Fd75C3e124E9b332BBB445FA076e",
-  "ramenDev": "0x18d7C1AD00D336C9BFC304fE828Da9fE29656c31",
+  "ramenDev": "0x85abE8E3bed0d4891ba201Af1e212FE50bb65a26",
   "deploymentBlock": 52185716,
   "deploymentTransactions": {
     "otc": "0xcefe32a08a4091f540c56ec483cdc22cd0df1c2b7b59d0b4947f4f88024ed67a",
     "liquidityLocker": "0x4f743535a89035c40c6aa8d5930546d4638f98712edae42271f31d54835859f4",
     "launcher": "0xa9edf0e272755eb6a5054756701a6a9081e637bc2f0b17afad963ccddbe48c1b",
     "ethRouter": "0xc240b3c23392424de60df51c3301bb4e8f997d0538c08a7506fb266091b87bac"
+  },
+  "administrativeTransactions": {
+    "setRamenDev": "0xede5cb65a6bb76630c45861ccb56dd62ff3974897d6edb0f2e19cdf632911b57"
   },
   "uniswapV3PositionManager": "0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3",
   "uniswapV3SwapRouter": "0xCaf681a66D020601342297493863E78C959E5cb2",
