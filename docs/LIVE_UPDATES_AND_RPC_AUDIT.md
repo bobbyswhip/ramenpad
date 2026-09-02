@@ -35,7 +35,7 @@ Confirmed historical `eth_getLogs` scans use `ROBINHOOD_LOG_RPC_URLS` (the Robin
 
 When no paid archive provider is configured, the indexer queries one watched contract per paced request because the public endpoint rate-limits multi-address historical scans. Once a paid provider is configured, it automatically switches to batches of up to 100 pools, retaining free-first failover without creating per-pool paid calls.
 
-Free-only catch-up uses one 100-block range per tick and spaces watched-address log requests by 1.2 seconds to stay below the public endpoint's historical-query and burst-rate ceilings. Paid-backed indexing defaults to twenty 1,000-block ranges per tick. `RAMENPAD_INDEXER_BLOCK_RANGE` and `RAMENPAD_INDEXER_RANGES_PER_TICK` can override those values.
+Free-only catch-up uses one 100-block range per tick and spaces watched-address log requests by three seconds to stay below the public endpoint's historical-query and burst-rate ceilings. Paid-backed indexing defaults to twenty 1,000-block ranges per tick. `RAMENPAD_INDEXER_BLOCK_RANGE` and `RAMENPAD_INDEXER_RANGES_PER_TICK` can override those values.
 
 The health endpoint exposes aggregate success/failure counters by free or paid tier, never URLs or keys. A paid Robinhood Alchemy URL must be supplied explicitly; unrelated-chain Alchemy credentials must not be reused.
 

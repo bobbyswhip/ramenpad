@@ -37,7 +37,7 @@ interface FeePoolRow extends PoolRow {
 }
 
 function paceRpc() {
-  return new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+  return new Promise<void>((resolve) => setTimeout(resolve, 3_000));
 }
 
 export class RamenpadIndexer {
