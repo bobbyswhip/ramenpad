@@ -50,3 +50,5 @@ The health endpoint exposes aggregate success/failure counters by free or paid t
 - Immutable launcher dependencies are configured once instead of reread before every swap/claim. The backend also memoizes its immutable launcher contract reads.
 
 This keeps authenticated/premium RPC credentials off the browser and ensures normal indexing consumes the free tier first. Paid service is failover capacity, not the steady-state path.
+
+The approved WebSocket-first scale-out design and its migration plan are documented in [Scalable live indexing architecture](SCALABLE_INDEXING_ARCHITECTURE.md). The polling behavior above describes the currently deployed recovery-safe implementation until that staged migration is completed.
