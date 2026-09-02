@@ -42,16 +42,18 @@ const upload = multer({
 export function createRamenpadRouter(db: Database) {
   const router = Router();
   const launcherAddress = process.env.RAMENPAD_LAUNCHER_ADDRESS;
-  let systemContracts: Promise<{ locker: string | null; otc: string | null }> | undefined;
+  let systemContracts: Promise<{ locker: string | null; otc: string | null; owner: string | null; ramenDev: string | null }> | undefined;
 
   function getSystemContracts() {
     if (!launcherAddress || !/^0x[0-9a-fA-F]{40}$/.test(launcherAddress)) {
-      return Promise.resolve({ locker: null, otc: null });
+      return Promise.resolve({ locker: null, otc: null, owner: null, ramenDev: null });
     }
     systemContracts ??= Promise.all([
       publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "locker" }),
       publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "otc" }),
-    ]).then(([locker, otc]) => ({ locker, otc })).catch((error) => {
+      publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "owner" }),
+      publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "ramenDev" }),
+    ]).then(([locker, otc, owner, ramenDev]) => ({ locker, otc, owner, ramenDev })).catch((error) => {
       systemContracts = undefined;
       throw error;
     });
@@ -60,13 +62,15 @@ export function createRamenpadRouter(db: Database) {
 
   router.get("/config", async (_request, response, next) => {
     try {
-      const { locker, otc } = await getSystemContracts();
+      const { locker, otc, owner, ramenDev } = await getSystemContracts();
       const { ramenUsd, ethUsd, ramenMarketCapUsd, ramenVolumeUsd } = await getMarketPrices();
       response.json({
         chainId: 4663,
         launcher: launcherAddress || null,
         locker,
         otc,
+        owner,
+        ramenDev,
         ethRouter: process.env.RAMENPAD_ETH_ROUTER_ADDRESS || null,
         ramenUsd,
         ethUsd,

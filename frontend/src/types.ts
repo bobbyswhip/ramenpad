@@ -37,6 +37,8 @@ export interface RamenpadConfig {
   locker: `0x${string}` | null;
   otc: `0x${string}` | null;
   ethRouter?: `0x${string}` | null;
+  owner?: `0x${string}` | null;
+  ramenDev?: `0x${string}` | null;
   ramenUsd?: number;
   ethUsd?: number;
   ramenMarketCapUsd?: number;

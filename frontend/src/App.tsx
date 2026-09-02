@@ -15,6 +15,14 @@ const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFra
 
 type ConnectedWallet = Awaited<ReturnType<typeof connectWallet>>;
 type CreatorClaimable = { token: string; ramen: string; status: "loading" | "ready" | "error" };
+type FeeDeckPosition = {
+  tokenShares: bigint;
+  tokenPrincipal: bigint;
+  tokenYield: bigint;
+  ramenShares: bigint;
+  ramenPrincipal: bigint;
+  ramenYield: bigint;
+};
 
 async function ensureAllowance(
   wallet: ConnectedWallet,
@@ -665,7 +673,32 @@ function ExploreDashboard({ tokens, trades, kpis, onSelect }: {
   </section>;
 }
 
-function ProfilePage({ account, connect, tokens, claim, claimAll, updateImage, busy, claimables }: {
+function ProtocolDeckPanel({ role, tokens, positions, busy, withdraw }: {
+  role: "OWNER" | "RAMEN DEV";
+  tokens: TokenSummary[];
+  positions: Record<string, FeeDeckPosition>;
+  busy: string;
+  withdraw: (token: TokenSummary, side: "token" | "ramen", shares: bigint) => void;
+}) {
+  const managed = tokens.filter((token) => {
+    const position = positions[token.tokenAddress.toLowerCase()];
+    return position && (position.tokenShares > 0n || position.ramenShares > 0n);
+  });
+  return <section className="protocol-decks">
+    <div className="protocol-deck-head"><div><span className="eyebrow">{role} · AUTOMATED FEE DECKS</span><h2>Your churn deposits</h2><p>Protocol fee shares are credited here instead of sent loose to your wallet. Withdraw either full position to receive its current principal and accrued opposite-asset yield.</p></div><b>{managed.length} ACTIVE</b></div>
+    <div className="protocol-deck-list">{managed.length ? managed.map((token) => {
+      const position = positions[token.tokenAddress.toLowerCase()];
+      return <article className="protocol-deck" key={token.tokenAddress}>
+        <div className="protocol-deck-token">{token.imageUrl ? <img src={token.imageUrl} alt="" /> : <span>🍜</span>}<div><small>${token.symbol}</small><strong>{token.name}</strong></div></div>
+        <div><small>TOKEN DECK</small><b>{tokenAmount(formatUnits(position.tokenPrincipal, 18))} {token.symbol}</b><span>+ {tokenAmount(formatUnits(position.tokenYield, 18))} RAMEN yield</span><button disabled={!!busy || position.tokenShares === 0n} onClick={() => withdraw(token, "token", position.tokenShares)}>{busy === `${token.tokenAddress}:token` ? "WITHDRAWING…" : "WITHDRAW TOKEN DECK"}</button></div>
+        <div><small>RAMEN DECK</small><b>{tokenAmount(formatUnits(position.ramenPrincipal, 18))} RAMEN</b><span>+ {tokenAmount(formatUnits(position.ramenYield, 18))} {token.symbol} yield</span><button disabled={!!busy || position.ramenShares === 0n} onClick={() => withdraw(token, "ramen", position.ramenShares)}>{busy === `${token.tokenAddress}:ramen` ? "WITHDRAWING…" : "WITHDRAW RAMEN DECK"}</button></div>
+      </article>;
+    }) : <div className="empty">No active fee-deck positions for this protocol wallet.</div>}</div>
+    <p className="protocol-deck-note">Withdrawing removes the current position. Future locker harvests will create new protocol fee deposits automatically under the immutable fee policy.</p>
+  </section>;
+}
+
+function ProfilePage({ account, connect, tokens, claim, claimAll, updateImage, busy, claimables, protocolRole, deckPositions, deckBusy, withdrawDeck }: {
   account?: `0x${string}`;
   connect: () => Promise<void>;
   tokens: TokenSummary[];
@@ -674,9 +707,14 @@ function ProfilePage({ account, connect, tokens, claim, claimAll, updateImage, b
   updateImage: (token: TokenSummary, file: File) => void;
   busy: boolean;
   claimables: Record<string, CreatorClaimable>;
+  protocolRole?: "OWNER" | "RAMEN DEV";
+  deckPositions: Record<string, FeeDeckPosition>;
+  deckBusy: string;
+  withdrawDeck: (token: TokenSummary, side: "token" | "ramen", shares: bigint) => void;
 }) {
   const owned = account ? tokens.filter((token) => token.launcher.toLowerCase() === account.toLowerCase()) : [];
   return <section className="profile-page">
+    {account && protocolRole && <ProtocolDeckPanel role={protocolRole} tokens={tokens} positions={deckPositions} busy={deckBusy} withdraw={withdrawDeck} />}
     <div className="profile-hero"><div><span className="eyebrow">CREATOR DASHBOARD</span><h1>Your launches</h1><p>Manage artwork and collect the 69% creator share from every token you deployed.</p></div>
       {!account ? <button onClick={connect}>CONNECT WALLET</button> : <div className="profile-total"><small>TOKENS DEPLOYED</small><b>{owned.length}</b><span>{shortAddress(account)}</span></div>}
     </div>
@@ -704,6 +742,8 @@ export default function App() {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [kpis, setKpis] = useState<ProtocolKpis>();
   const [locker, setLocker] = useState<`0x${string}`>();
+  const [protocolOwner, setProtocolOwner] = useState<`0x${string}`>();
+  const [ramenDev, setRamenDev] = useState<`0x${string}`>();
   const [notice, setNotice] = useState("");
   const [ethBalance, setEthBalance] = useState("0");
   const [ramenBalance, setRamenBalance] = useState("0");
@@ -721,6 +761,9 @@ export default function App() {
   const [claimingAll, setClaimingAll] = useState(false);
   const [claimables, setClaimables] = useState<Record<string, CreatorClaimable>>({});
   const [claimableRefresh, setClaimableRefresh] = useState(0);
+  const [deckPositions, setDeckPositions] = useState<Record<string, FeeDeckPosition>>({});
+  const [deckRefresh, setDeckRefresh] = useState(0);
+  const [deckBusy, setDeckBusy] = useState("");
   const [dark, setDark] = useState(() => localStorage.getItem("ramenpad-theme") === "dark");
   const marketTokens = useMemo<TokenSummary[]>(() => [{
     tokenAddress: RAMEN,
@@ -750,6 +793,15 @@ export default function App() {
         : [];
     return scoped.map((token) => `${token.tokenAddress.toLowerCase()}:${token.positionTokenId}`).join("|");
   }, [account, selectedToken, tab, tokens]);
+  const protocolRole = useMemo<"OWNER" | "RAMEN DEV" | undefined>(() => {
+    if (!account) return undefined;
+    if (account.toLowerCase() === protocolOwner?.toLowerCase()) return "OWNER";
+    if (account.toLowerCase() === ramenDev?.toLowerCase()) return "RAMEN DEV";
+    return undefined;
+  }, [account, protocolOwner, ramenDev]);
+  const deckScopeKey = useMemo(() => tab === "profile" && protocolRole
+    ? tokens.map((token) => token.tokenAddress.toLowerCase()).sort().join("|")
+    : "", [protocolRole, tab, tokens]);
 
   const openToken = useCallback((token: TokenSummary) => {
     setSelectedTokenAddress(token.tokenAddress);
@@ -806,6 +858,8 @@ export default function App() {
     setTrades(tradeData.trades);
     setKpis(kpiData.kpis);
     if (config.locker) setLocker(config.locker);
+    if (config.owner) setProtocolOwner(config.owner);
+    if (config.ramenDev) setRamenDev(config.ramenDev);
     applyMarket(config);
   }, [applyMarket]);
 
@@ -916,6 +970,42 @@ export default function App() {
   }, [account, locker, claimableScopeKey, claimableRefresh]);
 
   useEffect(() => {
+    if (!account || !protocolRole || !deckScopeKey) { setDeckPositions({}); return; }
+    let cancelled = false;
+    const listedTokens = tokensRef.current.filter((token) => deckScopeKey.includes(token.tokenAddress.toLowerCase()));
+    const refresh = async () => {
+      try {
+        const results = await publicClient.multicall({
+          allowFailure: true,
+          contracts: listedTokens.flatMap((token) => ([0, 1] as const).map((side) => ({
+            address: OTC,
+            abi: otcAbi,
+            functionName: "positionInfo" as const,
+            args: [token.tokenAddress, side, account] as const,
+          }))),
+        });
+        if (cancelled) return;
+        const next: Record<string, FeeDeckPosition> = {};
+        listedTokens.forEach((token, index) => {
+          const tokenResult = results[index * 2];
+          const ramenResult = results[index * 2 + 1];
+          if (tokenResult.status !== "success" || ramenResult.status !== "success") return;
+          const tokenPosition = tokenResult.result as readonly [bigint, bigint, bigint];
+          const ramenPosition = ramenResult.result as readonly [bigint, bigint, bigint];
+          next[token.tokenAddress.toLowerCase()] = {
+            tokenShares: tokenPosition[0], tokenPrincipal: tokenPosition[1], tokenYield: tokenPosition[2],
+            ramenShares: ramenPosition[0], ramenPrincipal: ramenPosition[1], ramenYield: ramenPosition[2],
+          };
+        });
+        setDeckPositions(next);
+      } catch { /* retain the last on-chain deck snapshot */ }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 30_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [account, deckRefresh, deckScopeKey, protocolRole]);
+
+  useEffect(() => {
     const refreshFees = () => Promise.all([getTokens(), getKpis()]).then(([tokenData, kpiData]) => {
       setTokens(tokenData.tokens); setKpis(kpiData.kpis);
     });
@@ -1007,6 +1097,33 @@ export default function App() {
     finally { setClaimingAll(false); }
   }
 
+  async function withdrawDeck(token: TokenSummary, side: "token" | "ramen", shares: bigint) {
+    if (!account || !protocolRole || shares === 0n || deckBusy) return;
+    const busyKey = `${token.tokenAddress}:${side}`;
+    setDeckBusy(busyKey);
+    try {
+      const wallet = await connectWallet();
+      if (wallet.account.toLowerCase() !== account.toLowerCase()) throw new Error("Connected wallet changed");
+      setNotice(`Confirm full ${side === "token" ? token.symbol : "RAMEN"} fee-deck withdrawal…`);
+      const hash = await wallet.client.writeContract({
+        address: OTC,
+        abi: otcAbi,
+        functionName: side === "token" ? "withdrawToken" : "withdrawRamen",
+        args: [token.tokenAddress, shares, account],
+      });
+      setNotice("Fee-deck withdrawal sent — waiting for confirmation…");
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") throw new Error("Fee-deck withdrawal failed");
+      setNotice(`${side === "token" ? token.symbol : "RAMEN"} fee deck withdrawn to your wallet.`);
+      setDeckRefresh((current) => current + 1);
+      await refreshBalances(account);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Fee-deck withdrawal failed");
+    } finally {
+      setDeckBusy("");
+    }
+  }
+
   async function changeTokenImage(token: TokenSummary, file: File) {
     try {
       if (file.size > 2 * 1024 * 1024) throw new Error("Artwork must be 2 MB or smaller");
@@ -1046,7 +1163,7 @@ export default function App() {
               ? <RamenMarketCard token={selectedToken} account={account} onNotice={setNotice} ethBalance={ethBalance} ramenBalance={ramenBalance} onBalancesChanged={refreshTradingBalances} />
               : <TokenCard token={selectedToken} account={account} claim={claim} onNotice={setNotice} locker={locker} claimable={claimables[selectedToken.tokenAddress.toLowerCase()]} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} tokenBalance={tokenBalances[selectedToken.tokenAddress.toLowerCase()] || "0"} onBalancesChanged={refreshTradingBalances} />}
           </section> : <ExploreDashboard tokens={marketTokens} trades={trades} kpis={kpis} onSelect={openToken} />
-        ) : <ProfilePage account={account} connect={connect} tokens={tokens} claim={claim} claimAll={claimAll} updateImage={changeTokenImage} busy={claimingAll} claimables={claimables} />}
+        ) : <ProfilePage account={account} connect={connect} tokens={tokens} claim={claim} claimAll={claimAll} updateImage={changeTokenImage} busy={claimingAll} claimables={claimables} protocolRole={protocolRole} deckPositions={deckPositions} deckBusy={deckBusy} withdrawDeck={withdrawDeck} />}
       </main>
       {notice && <button className="notice" onClick={() => setNotice("")}>{notice}<span>×</span></button>}
       <footer><div className="wallet-balances">

@@ -44,6 +44,8 @@ After routed fills, protocol yield is automatically moved into the opposite prin
 
 This compounds `ramenDev` and owner positions without requiring them to monitor every launched market. Public `churnProtocol` remains available as a recovery/maintenance entry point.
 
+When either current role wallet connects, the Profile page exposes its token-deck and RAMEN-deck principal and pending yield for every market. Each position can be withdrawn in full to that wallet. A withdrawal removes the current shares and pays their accrued yield; future protocol fee harvests will credit new shares again because the 31% protocol routing policy remains automatic.
+
 ## KPIs
 
 The backend separately indexes gross harvested fees, launcher-earned amounts, launcher claims, pending launcher balances, protocol-earned amounts, and successful protocol deck deposits. The API exposes per-token and protocol-wide totals for the frontend.

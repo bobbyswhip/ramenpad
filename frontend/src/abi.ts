@@ -202,6 +202,43 @@ export const otcAbi = [
     ],
     outputs: [{ name: "ramenOut", type: "uint256" }],
   },
+  {
+    type: "function",
+    name: "positionInfo",
+    stateMutability: "view",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "side", type: "uint8" },
+      { name: "beneficiary", type: "address" },
+    ],
+    outputs: [
+      { name: "shares", type: "uint256" },
+      { name: "principal", type: "uint256" },
+      { name: "pendingYield", type: "uint256" },
+    ],
+  },
+  {
+    type: "function",
+    name: "withdrawToken",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "shares", type: "uint256" },
+      { name: "recipient", type: "address" },
+    ],
+    outputs: [{ name: "principal", type: "uint256" }, { name: "ramenYield", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "withdrawRamen",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "shares", type: "uint256" },
+      { name: "recipient", type: "address" },
+    ],
+    outputs: [{ name: "principal", type: "uint256" }, { name: "tokenYield", type: "uint256" }],
+  },
 ] as const;
 
 export const quoterAbi = [{
