@@ -38,6 +38,8 @@ Free-only catch-up processes 1,000-block ranges without producing per-address re
 
 The cursor is committed only after every watched contract in a range has been processed successfully. Launch, trade, and fee rows use conflict-safe event identities, so service restarts resume from the next uncommitted block without gaps or duplicates.
 
+If a restart backlog exceeds the configured per-pass range budget, catch-up passes continue every five seconds until the confirmed head is reached. The ten-minute interval begins only after the indexer is current.
+
 `GET /health/ramenpad` reports `launchReady=false` until startup catch-up reaches the confirmed head, and after any indexing failure. The launch form checks this non-cacheable endpoint immediately before asking the wallet to submit. That pauses UI-originated launches during backend deploys while the durable cursor remains the recovery guarantee for direct contract calls and transactions already in flight.
 
 The health endpoint exposes aggregate success/failure counters by free or paid tier, never URLs or keys. A paid Robinhood Alchemy URL must be supplied explicitly; unrelated-chain Alchemy credentials must not be reused.

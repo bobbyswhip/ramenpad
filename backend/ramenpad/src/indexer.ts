@@ -203,7 +203,9 @@ export class RamenpadIndexer {
 
   private schedule() {
     if (this.stopped) return;
-    const delay = this.consecutiveFailures
+    const delay = !this.caughtUp
+      ? 5_000
+      : this.consecutiveFailures
       ? Math.min(15_000 * (2 ** this.consecutiveFailures), this.maxBackoffMs)
       : this.intervalMs;
     this.timer = setTimeout(async () => {
