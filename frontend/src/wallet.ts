@@ -1,5 +1,5 @@
 import { createPublicClient, createWalletClient, custom } from "viem";
-import { robinhood, transport } from "./config";
+import { PUBLIC_RPC_URLS, robinhood, transport } from "./config";
 
 declare global {
   interface Window { ethereum?: { request(args: { method: string; params?: unknown[] | object }): Promise<unknown> } }
@@ -21,7 +21,7 @@ export async function connectWallet() {
         chainId: "0x1237",
         chainName: "Robinhood Chain",
         nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-        rpcUrls: ["https://rpc.mainnet.chain.robinhood.com"],
+        rpcUrls: [...PUBLIC_RPC_URLS],
         blockExplorerUrls: ["https://robinhoodchain.blockscout.com"],
       }],
     });

@@ -6,6 +6,7 @@ import { createDatabase, migrate } from "./db.js";
 import { createRamenpadRouter } from "./router.js";
 import { RamenpadIndexer } from "./indexer.js";
 import { RamenpadKeeper } from "./keeper.js";
+import { getRpcStats } from "./config.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -26,7 +27,12 @@ app.use("/ramenpad/uploads", express.static(path.resolve(process.cwd(), "uploads
 const db = createDatabase();
 await migrate(db);
 app.use("/api/ramenpad", createRamenpadRouter(db));
-app.get("/health/ramenpad", (_request, response) => response.json({ ok: true, service: "ramenpad", chainId: 4663 }));
+app.get("/health/ramenpad", (_request, response) => response.json({
+  ok: true,
+  service: "ramenpad",
+  chainId: 4663,
+  rpc: getRpcStats(),
+}));
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("[ramenpad:http]", error);
   const message = error instanceof Error ? error.message : "Internal server error";

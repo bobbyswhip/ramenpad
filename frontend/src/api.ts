@@ -1,6 +1,6 @@
 import { io } from "socket.io-client";
 import { API_URL } from "./config";
-import type { LaunchQuote, ProtocolKpis, RamenpadConfig, TokenSummary, Trade } from "./types";
+import type { LaunchQuote, MarketUpdate, ProtocolKpis, RamenpadConfig, TokenSummary, TokenUpdate, Trade } from "./types";
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
@@ -55,11 +55,21 @@ export function subscribeLive(
   onTrade: (trade: Trade) => void,
   onLaunch: (token: TokenSummary) => void,
   onFees?: () => void,
+  onTokenUpdate?: (update: TokenUpdate) => void,
+  onMarket?: (update: MarketUpdate) => void,
+  onReconnect?: () => void,
 ) {
   const socketBase = API_URL.replace(/\/api\/ramenpad$/, "");
   const socket = io(socketBase, { path: "/ramenpad/socket.io", transports: ["websocket", "polling"] });
   socket.on("ramenpad:trade", onTrade);
   socket.on("ramenpad:launch", onLaunch);
   if (onFees) socket.on("ramenpad:fees", onFees);
+  if (onTokenUpdate) socket.on("ramenpad:tokens:update", onTokenUpdate);
+  if (onMarket) socket.on("ramenpad:market", onMarket);
+  let connectedOnce = false;
+  socket.on("connect", () => {
+    if (connectedOnce) onReconnect?.();
+    connectedOnce = true;
+  });
   return () => { socket.disconnect(); };
 }

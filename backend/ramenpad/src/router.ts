@@ -41,19 +41,27 @@ const upload = multer({
 
 export function createRamenpadRouter(db: Database) {
   const router = Router();
+  const launcherAddress = process.env.RAMENPAD_LAUNCHER_ADDRESS;
+  let systemContracts: Promise<{ locker: string | null; otc: string | null }> | undefined;
+
+  function getSystemContracts() {
+    if (!launcherAddress || !/^0x[0-9a-fA-F]{40}$/.test(launcherAddress)) {
+      return Promise.resolve({ locker: null, otc: null });
+    }
+    systemContracts ??= Promise.all([
+      publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "locker" }),
+      publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "otc" }),
+    ]).then(([locker, otc]) => ({ locker, otc })).catch((error) => {
+      systemContracts = undefined;
+      throw error;
+    });
+    return systemContracts;
+  }
 
   router.get("/config", async (_request, response, next) => {
     try {
-      const launcherAddress = process.env.RAMENPAD_LAUNCHER_ADDRESS;
-      let locker: string | null = null;
-      let otc: string | null = null;
-      if (launcherAddress && /^0x[0-9a-fA-F]{40}$/.test(launcherAddress)) {
-        [locker, otc] = await Promise.all([
-          publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "locker" }),
-          publicClient.readContract({ address: launcherAddress as `0x${string}`, abi: launcherAbi, functionName: "otc" }),
-        ]);
-      }
-      const { ramenUsd, ethUsd } = await getMarketPrices();
+      const { locker, otc } = await getSystemContracts();
+      const { ramenUsd, ethUsd, ramenMarketCapUsd, ramenVolumeUsd } = await getMarketPrices();
       response.json({
         chainId: 4663,
         launcher: launcherAddress || null,
@@ -62,6 +70,8 @@ export function createRamenpadRouter(db: Database) {
         ethRouter: process.env.RAMENPAD_ETH_ROUTER_ADDRESS || null,
         ramenUsd,
         ethUsd,
+        ramenMarketCapUsd,
+        ramenVolumeUsd,
         totalSupply: TOTAL_SUPPLY,
         targetMarketCapUsd: TARGET_MARKET_CAP_USD,
         targetTokenUsd: TARGET_TOKEN_USD,

@@ -29,12 +29,14 @@ export async function migrate(db: Database) {
       launch_tx text UNIQUE NOT NULL,
       launch_block bigint NOT NULL,
       launched_at timestamptz NOT NULL,
+      price_ramen numeric,
       price_usd numeric NOT NULL DEFAULT (2000.0 / 6942000.0),
       market_cap_usd numeric NOT NULL DEFAULT 2000,
       volume_usd numeric NOT NULL DEFAULT 0,
       created_at timestamptz NOT NULL DEFAULT now()
     );
     ALTER TABLE ramenpad.launches ADD COLUMN IF NOT EXISTS image_updated_at timestamptz;
+    ALTER TABLE ramenpad.launches ADD COLUMN IF NOT EXISTS price_ramen numeric;
     ALTER TABLE ramenpad.launches ALTER COLUMN price_usd SET DEFAULT (2000.0 / 6942000.0);
     ALTER TABLE ramenpad.launches ALTER COLUMN market_cap_usd SET DEFAULT 2000;
 

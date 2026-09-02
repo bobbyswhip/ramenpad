@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { decodeEventLog, encodeFunctionData, formatUnits, parseEther, parseUnits } from "viem";
 import { getConfig, getKpis, getQuote, getTokens, getTrades, subscribeLive, tokenImageUpdateMessage, updateTokenImage, uploadImage } from "./api";
 import { erc20Abi, ethRouterAbi, launcherAbi, lockerAbi, otcAbi, quoterAbi, v2RouterAbi } from "./abi";
-import { ETH_ROUTER, LAUNCHER, RAMEN, RAMEN_IMAGE, RAMEN_PAIR, TARGET_MARKET_CAP, TARGET_TOKEN_PRICE, TOTAL_SUPPLY, V2_ROUTER, V3_QUOTER, WETH, robinhood } from "./config";
-import type { ProtocolKpis, TokenSummary, Trade } from "./types";
+import { ETH_ROUTER, LAUNCHER, OTC, RAMEN, RAMEN_IMAGE, RAMEN_PAIR, TARGET_MARKET_CAP, TARGET_TOKEN_PRICE, TOTAL_SUPPLY, V2_ROUTER, V3_QUOTER, WETH, robinhood } from "./config";
+import type { MarketUpdate, ProtocolKpis, RamenpadConfig, TokenSummary, TokenUpdate, Trade } from "./types";
 import { connectWallet, publicClient, shortAddress } from "./wallet";
 import "./styles.css";
 
@@ -310,9 +310,7 @@ function SwapBox({ token, account, onNotice, payAsset, onPayAssetChange, ethBala
     setBusy(true);
     try {
       const wallet = await connectWallet();
-      const otcAddress = await publicClient.readContract({
-        address: LAUNCHER, abi: launcherAbi, functionName: "otc",
-      });
+      const otcAddress = OTC;
       let hash: `0x${string}`;
       if (side === "buy" && payAsset === "ETH") {
         onNotice(`Confirm one-step ETH → RAMEN → ${token.symbol} buy…`);
@@ -374,6 +372,135 @@ function SwapBox({ token, account, onNotice, payAsset, onPayAssetChange, ethBala
   );
 }
 
+function RamenSwapBox({ account, onNotice, ethBalance, ramenBalance, onBalancesChanged }: {
+  account?: `0x${string}`;
+  onNotice: (message: string) => void;
+  ethBalance: string;
+  ramenBalance: string;
+  onBalancesChanged: () => void;
+}) {
+  const [side, setSide] = useState<"buy" | "sell">("buy");
+  const [amount, setAmount] = useState("");
+  const [slippage, setSlippage] = useState("1");
+  const [busy, setBusy] = useState(false);
+  const [quotedOut, setQuotedOut] = useState<bigint>();
+  const [quoteState, setQuoteState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+
+  useEffect(() => {
+    setQuotedOut(undefined);
+    if (!amount || Number(amount) <= 0) { setQuoteState("idle"); return; }
+    let cancelled = false;
+    setQuoteState("loading");
+    const timer = window.setTimeout(async () => {
+      try {
+        const rawIn = parseUnits(amount, 18);
+        const amounts = await publicClient.readContract({
+          address: V2_ROUTER,
+          abi: v2RouterAbi,
+          functionName: "getAmountsOut",
+          args: [rawIn, side === "buy" ? [WETH, RAMEN] : [RAMEN, WETH]],
+        });
+        // RAMEN charges 2% when transferred out of its v2 pair on buys.
+        const output = side === "buy" ? amounts[1] * 98n / 100n : amounts[1];
+        if (!cancelled) { setQuotedOut(output); setQuoteState("ready"); }
+      } catch {
+        if (!cancelled) setQuoteState("error");
+      }
+    }, 450);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [amount, side]);
+
+  const slipBps = BigInt(Math.round(Math.min(50, Math.max(0.1, Number(slippage) || 1)) * 100));
+  const minOut = quotedOut ? quotedOut * (10_000n - slipBps) / 10_000n : 0n;
+
+  async function swap() {
+    if (!account) { onNotice("Connect your wallet to swap."); return; }
+    if (!amount || Number(amount) <= 0 || !quotedOut || busy) return;
+    setBusy(true);
+    try {
+      const wallet = await connectWallet();
+      const amountIn = parseUnits(amount, 18);
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+      let hash: `0x${string}`;
+      if (side === "buy") {
+        onNotice("Confirm ETH → RAMEN swap…");
+        hash = await wallet.client.writeContract({
+          address: V2_ROUTER,
+          abi: v2RouterAbi,
+          functionName: "swapExactETHForTokensSupportingFeeOnTransferTokens",
+          args: [minOut, [WETH, RAMEN], account, deadline],
+          value: amountIn,
+        });
+      } else {
+        await ensureAllowance(wallet, RAMEN, V2_ROUTER, amountIn, onNotice);
+        onNotice("Confirm RAMEN → ETH swap…");
+        hash = await wallet.client.writeContract({
+          address: V2_ROUTER,
+          abi: v2RouterAbi,
+          functionName: "swapExactTokensForETHSupportingFeeOnTransferTokens",
+          args: [amountIn, minOut, [RAMEN, WETH], account, deadline],
+        });
+      }
+      onNotice("Transaction sent — waiting for confirmation…");
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") throw new Error("RAMEN swap failed");
+      onNotice(`${side === "buy" ? "RAMEN buy" : "RAMEN sale"} confirmed.`);
+      setAmount("");
+      onBalancesChanged();
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "RAMEN swap failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const paySymbol = side === "buy" ? "ETH" : "RAMEN";
+  const receiveSymbol = side === "buy" ? "RAMEN" : "ETH";
+  return <div className="trade-panel ramen-trade-panel">
+    <div className="trade-head"><div className="swap-tabs">
+      <button className={side === "buy" ? "active" : ""} onClick={() => setSide("buy")}>BUY RAMEN</button>
+      <button className={side === "sell" ? "active" : ""} onClick={() => setSide("sell")}>SELL RAMEN</button>
+    </div><span>LIVE V2 QUOTE</span></div>
+    <BuyBalance asset={paySymbol} balance={side === "buy" ? ethBalance : ramenBalance} onFill={setAmount} />
+    <div className="trade-input"><small>YOU PAY</small><div><input inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value.replace(/[^0-9.]/g, ""))} placeholder="0.0" /><b>{paySymbol}</b></div></div>
+    <div className="quote-card">
+      <div><span>YOU RECEIVE</span><b>{quoteState === "loading" ? "Quoting…" : quotedOut ? `${Number(formatUnits(quotedOut, 18)).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${receiveSymbol}` : "—"}</b></div>
+      <div><span>ROUTE</span><b>ETH ⇄ RAMEN · V2 POOL</b></div>
+      <div><span>MINIMUM RECEIVED</span><b>{minOut ? `${Number(formatUnits(minOut, 18)).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${receiveSymbol}` : "—"}</b></div>
+      {quoteState === "error" && <p>Quote unavailable for this amount.</p>}
+    </div>
+    <div className="trade-controls"><label>MAX SLIPPAGE <span><input inputMode="decimal" value={slippage} onChange={(event) => setSlippage(event.target.value.replace(/[^0-9.]/g, ""))} />%</span></label>
+      <button className="swap-submit" disabled={busy || !amount || quoteState !== "ready"} onClick={swap}>{busy ? "CONFIRMING…" : account ? `${side === "buy" ? "BUY" : "SELL"} RAMEN` : "CONNECT TO TRADE"}</button></div>
+  </div>;
+}
+
+function RamenMarketCard({ token, account, onNotice, ethBalance, ramenBalance, onBalancesChanged }: {
+  token: TokenSummary;
+  account?: `0x${string}`;
+  onNotice: (message: string) => void;
+  ethBalance: string;
+  ramenBalance: string;
+  onBalancesChanged: () => void;
+}) {
+  return <article className="token-card ramen-market-card">
+    <div className="token-art"><img src={RAMEN_IMAGE} alt="RAMEN" /></div>
+    <div className="token-main">
+      <div><h3>Ramen</h3><span>$RAMEN · CORE PAIR</span></div>
+      <div className="token-stats">
+        <span><small>MARKET CAP</small>{token.marketCapUsd ? money.format(token.marketCapUsd) : "—"}</span>
+        <span><small>24H VOLUME</small>{money.format(token.volumeUsd || 0)}</span>
+        <span><small>PRICE</small>${(token.priceUsd || 0).toPrecision(4)}</span>
+        <span><small>PAIR</small>RAMEN / ETH</span>
+      </div>
+      <div className="token-actions">
+        <a href={`https://dexscreener.com/robinhood/${RAMEN_PAIR}`} target="_blank" rel="noreferrer">DEXSCREENER ↗</a>
+        <a href={`${robinhood.blockExplorers.default.url}/address/${RAMEN}`} target="_blank" rel="noreferrer">CONTRACT ↗</a>
+      </div>
+      <RamenSwapBox account={account} onNotice={onNotice} ethBalance={ethBalance} ramenBalance={ramenBalance} onBalancesChanged={onBalancesChanged} />
+    </div>
+  </article>;
+}
+
 function TokenCard({ token, account, claim, onNotice, locker, claimable, payAsset, onPayAssetChange, ethBalance, ramenBalance, tokenBalance, onBalancesChanged }: {
   token: TokenSummary;
   account?: `0x${string}`;
@@ -432,7 +559,8 @@ function MiniToken({ token, badge, detail, onSelect }: { token: TokenSummary; ba
 }
 
 function HomeDiscovery({ tokens, trades, onSelect }: { tokens: TokenSummary[]; trades: Trade[]; onSelect: (token: TokenSummary) => void }) {
-  const top = [...tokens].sort((a, b) => (b.volumeUsd || 0) - (a.volumeUsd || 0)).slice(0, 3);
+  const ramen = tokens.find((token) => token.marketType === "ramen");
+  const top = tokens.filter((token) => token.marketType !== "ramen").sort((a, b) => (b.volumeUsd || 0) - (a.volumeUsd || 0)).slice(0, 3);
   const recentBuyTokens: Array<{ token: TokenSummary; trade: Trade }> = [];
   const seen = new Set<string>();
   for (const trade of trades) {
@@ -444,6 +572,7 @@ function HomeDiscovery({ tokens, trades, onSelect }: { tokens: TokenSummary[]; t
     if (recentBuyTokens.length === 10) break;
   }
   return <section className="home-discovery">
+    {ramen && <div className="ramen-market-callout"><img src={RAMEN_IMAGE} alt="RAMEN" /><div><span>CORE MARKET</span><h2>Swap RAMEN ⇄ ETH</h2><p>Live pricing from the RAMEN / ETH pool, with fee-aware quotes.</p></div><button type="button" onClick={() => onSelect(ramen)}>OPEN RAMEN MARKET →</button></div>}
     <div className="discovery-block"><div className="section-title"><div><span>LEADING THE MENU</span><h2>Top 3 tokens</h2></div><b>BY VOLUME</b></div>
       <div className="top-grid">{top.length ? top.map((token, index) => <MiniToken key={token.tokenAddress} token={token} badge={`#${index + 1} TOP TOKEN`} detail={`${money.format(token.volumeUsd || 0)} volume`} onSelect={onSelect} />) : <p className="discovery-empty">The leaderboard starts after the first launch.</p>}</div>
     </div>
@@ -454,11 +583,12 @@ function HomeDiscovery({ tokens, trades, onSelect }: { tokens: TokenSummary[]; t
 }
 
 function DiscoveryToken({ token, label, onSelect }: { token: TokenSummary; label?: string; onSelect: (token: TokenSummary) => void }) {
+  const isRamen = token.marketType === "ramen";
   return <button type="button" className="discovery-token" onClick={() => onSelect(token)}>
     <div className="discovery-token-art">{token.imageUrl ? <img src={token.imageUrl} alt="" /> : <span>R</span>}</div>
     <div className="discovery-token-name">{label && <small>{label}</small>}<strong>{token.name}</strong><span>${token.symbol} · {shortAddress(token.tokenAddress)}</span></div>
-    <div className="discovery-token-stat"><small>PRICE</small><b>${(token.priceUsd || TARGET_TOKEN_PRICE).toPrecision(4)}</b></div>
-    <div className="discovery-token-stat"><small>MARKET CAP</small><b>{money.format(token.marketCapUsd || TARGET_MARKET_CAP)}</b></div>
+    <div className="discovery-token-stat"><small>PRICE</small><b>{token.priceUsd ? `$${token.priceUsd.toPrecision(4)}` : "—"}</b></div>
+    <div className="discovery-token-stat"><small>MARKET CAP</small><b>{token.marketCapUsd ? money.format(token.marketCapUsd) : isRamen ? "—" : money.format(TARGET_MARKET_CAP)}</b></div>
     <div className="discovery-token-stat"><small>VOLUME</small><b>{money.format(token.volumeUsd || 0)}</b></div>
     <i>VIEW / BUY →</i>
   </button>;
@@ -479,8 +609,8 @@ function ExploreDashboard({ tokens, trades, kpis, onSelect }: {
 }) {
   const [search, setSearch] = useState("");
   const tokenByAddress = useMemo(() => new Map(tokens.map((token) => [token.tokenAddress.toLowerCase(), token])), [tokens]);
-  const top = useMemo(() => [...tokens].sort((a, b) => (b.volumeUsd || 0) - (a.volumeUsd || 0)).slice(0, 5), [tokens]);
-  const newest = useMemo(() => [...tokens].sort((a, b) => new Date(b.launchedAt).getTime() - new Date(a.launchedAt).getTime()).slice(0, 6), [tokens]);
+  const top = useMemo(() => tokens.filter((token) => token.marketType !== "ramen").sort((a, b) => (b.volumeUsd || 0) - (a.volumeUsd || 0)).slice(0, 5), [tokens]);
+  const newest = useMemo(() => tokens.filter((token) => token.marketType !== "ramen").sort((a, b) => new Date(b.launchedAt).getTime() - new Date(a.launchedAt).getTime()).slice(0, 6), [tokens]);
   const hot = useMemo(() => {
     const seen = new Set<string>();
     const result: Array<{ token: TokenSummary; trade: Trade }> = [];
@@ -584,18 +714,42 @@ export default function App() {
   const [paymentPinned, setPaymentPinned] = useState(false);
   const [ramenUsd, setRamenUsd] = useState(0);
   const [ethUsd, setEthUsd] = useState(0);
+  const [ramenMarketCapUsd, setRamenMarketCapUsd] = useState(0);
+  const [ramenVolumeUsd, setRamenVolumeUsd] = useState(0);
+  const ramenUsdRef = useRef(ramenUsd);
+  ramenUsdRef.current = ramenUsd;
   const [claimingAll, setClaimingAll] = useState(false);
   const [claimables, setClaimables] = useState<Record<string, CreatorClaimable>>({});
   const [claimableRefresh, setClaimableRefresh] = useState(0);
   const [dark, setDark] = useState(() => localStorage.getItem("ramenpad-theme") === "dark");
-  const ownedClaimKey = useMemo(() => account ? tokens
-    .filter((token) => token.launcher.toLowerCase() === account.toLowerCase())
-    .map((token) => `${token.tokenAddress.toLowerCase()}:${token.positionTokenId}`)
-    .join("|") : "", [account, tokens]);
-  const tokenBalanceKey = useMemo(() => tokens.map((token) => token.tokenAddress.toLowerCase()).sort().join("|"), [tokens]);
+  const marketTokens = useMemo<TokenSummary[]>(() => [{
+    tokenAddress: RAMEN,
+    poolAddress: RAMEN_PAIR,
+    launcher: "0x0000000000000000000000000000000000000000",
+    positionTokenId: "0",
+    name: "Ramen",
+    symbol: "RAMEN",
+    imageUrl: RAMEN_IMAGE,
+    launchedAt: "2025-01-01T00:00:00.000Z",
+    priceUsd: ramenUsd,
+    marketCapUsd: ramenMarketCapUsd || undefined,
+    volumeUsd: ramenVolumeUsd,
+    marketType: "ramen",
+  }, ...tokens], [ramenMarketCapUsd, ramenUsd, ramenVolumeUsd, tokens]);
   const selectedToken = useMemo(() => selectedTokenAddress
-    ? tokens.find((token) => token.tokenAddress.toLowerCase() === selectedTokenAddress.toLowerCase())
-    : undefined, [selectedTokenAddress, tokens]);
+    ? marketTokens.find((token) => token.tokenAddress.toLowerCase() === selectedTokenAddress.toLowerCase())
+    : undefined, [marketTokens, selectedTokenAddress]);
+  const tokenBalanceKey = selectedToken?.marketType !== "ramen" ? selectedToken?.tokenAddress.toLowerCase() || "" : "";
+  const claimableScopeKey = useMemo(() => {
+    if (!account) return "";
+    const owned = tokens.filter((token) => token.launcher.toLowerCase() === account.toLowerCase());
+    const scoped = tab === "profile"
+      ? owned
+      : selectedToken?.marketType !== "ramen" && selectedToken?.launcher.toLowerCase() === account.toLowerCase()
+        ? [selectedToken]
+        : [];
+    return scoped.map((token) => `${token.tokenAddress.toLowerCase()}:${token.positionTokenId}`).join("|");
+  }, [account, selectedToken, tab, tokens]);
 
   const openToken = useCallback((token: TokenSummary) => {
     setSelectedTokenAddress(token.tokenAddress);
@@ -639,6 +793,22 @@ export default function App() {
     setBalanceRefresh((current) => current + 1);
   }, [account, refreshBalances]);
 
+  const applyMarket = useCallback((market: Partial<RamenpadConfig & MarketUpdate>) => {
+    if (market.ramenUsd) setRamenUsd(market.ramenUsd);
+    if (market.ethUsd) setEthUsd(market.ethUsd);
+    if (market.ramenMarketCapUsd !== undefined) setRamenMarketCapUsd(market.ramenMarketCapUsd);
+    if (market.ramenVolumeUsd !== undefined) setRamenVolumeUsd(market.ramenVolumeUsd);
+  }, []);
+
+  const syncSnapshot = useCallback(async () => {
+    const [tokenData, tradeData, kpiData, config] = await Promise.all([getTokens(), getTrades(), getKpis(), getConfig()]);
+    setTokens(tokenData.tokens);
+    setTrades(tradeData.trades);
+    setKpis(kpiData.kpis);
+    if (config.locker) setLocker(config.locker);
+    applyMarket(config);
+  }, [applyMarket]);
+
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     localStorage.setItem("ramenpad-theme", dark ? "dark" : "light");
@@ -665,7 +835,7 @@ export default function App() {
   useEffect(() => {
     if (!account || !tokenBalanceKey) { setTokenBalances({}); return; }
     let cancelled = false;
-    const listedTokens = [...tokensRef.current];
+    const listedTokens = tokensRef.current.filter((token) => token.tokenAddress.toLowerCase() === tokenBalanceKey);
     const refresh = async () => {
       try {
         const results = await publicClient.multicall({
@@ -699,8 +869,9 @@ export default function App() {
   }, [account, balancesReady, ethBalance, ethUsd, paymentPinned, ramenBalance, ramenUsd]);
 
   useEffect(() => {
-    if (!account || !locker || !ownedClaimKey) { setClaimables({}); return; }
-    const owned = tokensRef.current.filter((token) => token.launcher.toLowerCase() === account.toLowerCase());
+    if (!account || !locker || !claimableScopeKey) { setClaimables({}); return; }
+    const scopedAddresses = new Set(claimableScopeKey.split("|").map((entry) => entry.split(":")[0]));
+    const owned = tokensRef.current.filter((token) => scopedAddresses.has(token.tokenAddress.toLowerCase()));
     let cancelled = false;
     const refresh = async () => {
       setClaimables((current) => {
@@ -742,18 +913,13 @@ export default function App() {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 30_000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [account, locker, ownedClaimKey, claimableRefresh]);
+  }, [account, locker, claimableScopeKey, claimableRefresh]);
 
   useEffect(() => {
     const refreshFees = () => Promise.all([getTokens(), getKpis()]).then(([tokenData, kpiData]) => {
       setTokens(tokenData.tokens); setKpis(kpiData.kpis);
     });
-    Promise.all([getTokens(), getTrades(), getKpis(), getConfig()]).then(([tokenData, tradeData, kpiData, config]) => {
-      setTokens(tokenData.tokens); setTrades(tradeData.trades); setKpis(kpiData.kpis);
-      if (config.locker) setLocker(config.locker);
-      if (config.ramenUsd) setRamenUsd(config.ramenUsd);
-      if (config.ethUsd) setEthUsd(config.ethUsd);
-    }).catch(() => {});
+    void syncSnapshot().catch(() => {});
     return subscribeLive(
       (trade) => {
         setTrades((current) => [trade, ...current.filter((item) => item.id !== trade.id)].slice(0, 100));
@@ -763,16 +929,32 @@ export default function App() {
       },
       (token) => setTokens((current) => [token, ...current.filter((item) => item.tokenAddress !== token.tokenAddress)]),
       () => { void refreshFees(); },
+      (update: TokenUpdate) => setTokens((current) => current.map((token) => token.tokenAddress.toLowerCase() === update.tokenAddress.toLowerCase()
+        ? { ...token, priceUsd: update.priceUsd, marketCapUsd: update.marketCapUsd }
+        : token)),
+      (market: MarketUpdate) => {
+        const previousRamenUsd = ramenUsdRef.current;
+        if (previousRamenUsd > 0 && market.ramenUsd > 0 && previousRamenUsd !== market.ramenUsd) {
+          const ratio = market.ramenUsd / previousRamenUsd;
+          setTokens((current) => current.map((token) => ({
+            ...token,
+            priceUsd: token.priceUsd === undefined ? undefined : token.priceUsd * ratio,
+            marketCapUsd: token.marketCapUsd === undefined ? undefined : token.marketCapUsd * ratio,
+          })));
+        }
+        ramenUsdRef.current = market.ramenUsd;
+        applyMarket(market);
+      },
+      () => { void syncSnapshot().catch(() => {}); },
     );
-  }, []);
+  }, [applyMarket, syncSnapshot]);
 
   const buys = useMemo(() => trades.filter((trade) => trade.side === "buy"), [trades]);
 
   async function claim(token: TokenSummary) {
-    if (!LAUNCHER) return;
+    if (!LAUNCHER || !locker) return;
     try {
       const wallet = await connectWallet();
-      const locker = await publicClient.readContract({ address: LAUNCHER, abi: launcherAbi, functionName: "locker" });
       setNotice(`Claiming fees from LP #${token.positionTokenId}…`);
       const hash = await wallet.client.writeContract({
         address: locker,
@@ -850,18 +1032,20 @@ export default function App() {
           <button className={tab === "launch" ? "active" : ""} onClick={() => setTab("launch")}>LAUNCH</button>
           <button className={tab === "explore" ? "active" : ""} onClick={() => { setSelectedTokenAddress(undefined); setTab("explore"); }}>EXPLORE</button>
           <button className={tab === "profile" ? "active" : ""} onClick={() => setTab("profile")}>PROFILE</button>
-          <a href={`https://dexscreener.com/robinhood/${RAMEN_PAIR}`} target="_blank" rel="noreferrer">$RAMEN ↗</a>
+          <button onClick={() => openToken(marketTokens[0])}>$RAMEN</button>
         </nav>
         <button className="wallet" onClick={connect}>{account ? shortAddress(account) : "CONNECT"}<i /></button>
       </header>
       <LiveTape trades={buys} />
       <main>
-        {tab === "launch" ? <><LaunchForm account={account} connect={connect} onLaunched={(token) => { setTokens((list) => [token, ...list]); openToken(token); }} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} /><HomeDiscovery tokens={tokens} trades={trades} onSelect={openToken} /></> : tab === "explore" ? (
+        {tab === "launch" ? <><LaunchForm account={account} connect={connect} onLaunched={(token) => { setTokens((list) => [token, ...list]); openToken(token); }} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} /><HomeDiscovery tokens={marketTokens} trades={trades} onSelect={openToken} /></> : tab === "explore" ? (
           selectedToken ? <section className="explore token-detail-page">
             <button type="button" className="back-to-explore" onClick={() => setSelectedTokenAddress(undefined)}>← BACK TO LIVE EXPLORE</button>
-            <div className="token-detail-heading"><div><span className="eyebrow">TOKEN MARKET</span><h2>{selectedToken.name}</h2><p>Live market data, quotes and permanently locked liquidity.</p></div><b>${selectedToken.symbol}</b></div>
-            <TokenCard token={selectedToken} account={account} claim={claim} onNotice={setNotice} locker={locker} claimable={claimables[selectedToken.tokenAddress.toLowerCase()]} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} tokenBalance={tokenBalances[selectedToken.tokenAddress.toLowerCase()] || "0"} onBalancesChanged={refreshTradingBalances} />
-          </section> : <ExploreDashboard tokens={tokens} trades={trades} kpis={kpis} onSelect={openToken} />
+            <div className="token-detail-heading"><div><span className="eyebrow">TOKEN MARKET</span><h2>{selectedToken.name}</h2><p>{selectedToken.marketType === "ramen" ? "Swap directly between RAMEN and ETH with live, fee-aware quotes." : "Live market data, quotes and permanently locked liquidity."}</p></div><b>${selectedToken.symbol}</b></div>
+            {selectedToken.marketType === "ramen"
+              ? <RamenMarketCard token={selectedToken} account={account} onNotice={setNotice} ethBalance={ethBalance} ramenBalance={ramenBalance} onBalancesChanged={refreshTradingBalances} />
+              : <TokenCard token={selectedToken} account={account} claim={claim} onNotice={setNotice} locker={locker} claimable={claimables[selectedToken.tokenAddress.toLowerCase()]} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} tokenBalance={tokenBalances[selectedToken.tokenAddress.toLowerCase()] || "0"} onBalancesChanged={refreshTradingBalances} />}
+          </section> : <ExploreDashboard tokens={marketTokens} trades={trades} kpis={kpis} onSelect={openToken} />
         ) : <ProfilePage account={account} connect={connect} tokens={tokens} claim={claim} claimAll={claimAll} updateImage={changeTokenImage} busy={claimingAll} claimables={claimables} />}
       </main>
       {notice && <button className="notice" onClick={() => setNotice("")}>{notice}<span>×</span></button>}

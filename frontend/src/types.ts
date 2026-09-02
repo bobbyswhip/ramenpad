@@ -18,6 +18,7 @@ export interface TokenSummary {
   launcherRamenPending?: string;
   protocolTokenDeposited?: string;
   protocolRamenDeposited?: string;
+  marketType?: "launch" | "ramen";
 }
 
 export interface ProtocolKpis {
@@ -38,6 +39,22 @@ export interface RamenpadConfig {
   ethRouter?: `0x${string}` | null;
   ramenUsd?: number;
   ethUsd?: number;
+  ramenMarketCapUsd?: number;
+  ramenVolumeUsd?: number;
+}
+
+export interface TokenUpdate {
+  tokenAddress: `0x${string}`;
+  priceUsd: number;
+  marketCapUsd: number;
+  volumeDeltaUsd: number;
+}
+
+export interface MarketUpdate {
+  ramenUsd: number;
+  ethUsd: number;
+  ramenMarketCapUsd?: number;
+  ramenVolumeUsd?: number;
 }
 
 export interface Trade {

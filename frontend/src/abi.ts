@@ -131,13 +131,40 @@ export const erc20Abi = [
     type: "function", name: "balanceOf", stateMutability: "view",
     inputs: [{ name: "account", type: "address" }], outputs: [{ name: "", type: "uint256" }],
   },
+  {
+    type: "function", name: "totalSupply", stateMutability: "view",
+    inputs: [], outputs: [{ name: "", type: "uint256" }],
+  },
 ] as const;
 
-export const v2RouterAbi = [{
-  type: "function", name: "getAmountsOut", stateMutability: "view",
-  inputs: [{ name: "amountIn", type: "uint256" }, { name: "path", type: "address[]" }],
-  outputs: [{ name: "amounts", type: "uint256[]" }],
-}] as const;
+export const v2RouterAbi = [
+  {
+    type: "function", name: "getAmountsOut", stateMutability: "view",
+    inputs: [{ name: "amountIn", type: "uint256" }, { name: "path", type: "address[]" }],
+    outputs: [{ name: "amounts", type: "uint256[]" }],
+  },
+  {
+    type: "function", name: "swapExactETHForTokensSupportingFeeOnTransferTokens", stateMutability: "payable",
+    inputs: [
+      { name: "amountOutMin", type: "uint256" },
+      { name: "path", type: "address[]" },
+      { name: "to", type: "address" },
+      { name: "deadline", type: "uint256" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function", name: "swapExactTokensForETHSupportingFeeOnTransferTokens", stateMutability: "nonpayable",
+    inputs: [
+      { name: "amountIn", type: "uint256" },
+      { name: "amountOutMin", type: "uint256" },
+      { name: "path", type: "address[]" },
+      { name: "to", type: "address" },
+      { name: "deadline", type: "uint256" },
+    ],
+    outputs: [],
+  },
+] as const;
 
 export const ethRouterAbi = [{
   type: "function", name: "buyWithEth", stateMutability: "payable",

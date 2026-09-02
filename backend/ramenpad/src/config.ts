@@ -1,4 +1,4 @@
-import { defineChain, http, createPublicClient, type Address, type Hex } from "viem";
+import { defineChain, fallback, http, createPublicClient, type Address, type Hex } from "viem";
 
 export const CHAIN_ID = 4663;
 export const RAMEN = "0xe013e34F03F42d49E836d59CF6353B897c337777" as Address;
@@ -12,14 +12,55 @@ export const TARGET_2000_ACTIVATION_BLOCK = BigInt(
 );
 export const TICK_SPACING = 200;
 
+function urls(value?: string) {
+  return value?.split(",").map((url) => url.trim()).filter(Boolean) || [];
+}
+
+function unique(values: string[]) {
+  return [...new Set(values)];
+}
+
+export const FREE_RPC_URLS = unique([
+  ...urls(process.env.ROBINHOOD_FREE_RPC_URLS),
+  "https://robinhood-rpc.publicnode.com",
+  process.env.ROBINHOOD_RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
+  "https://rpc.mainnet.chain.robinhood.com",
+]);
+export const PAID_RPC_URLS = unique([
+  ...urls(process.env.ROBINHOOD_PAID_RPC_URLS),
+  ...urls(process.env.ROBINHOOD_PAID_RPC_URL),
+]).filter((url) => !FREE_RPC_URLS.includes(url));
+
 export const robinhood = defineChain({
   id: CHAIN_ID,
   name: "Robinhood Chain",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-  rpcUrls: { default: { http: [process.env.ROBINHOOD_RPC_URL || "https://rpc.mainnet.chain.robinhood.com"] } },
+  rpcUrls: { default: { http: [...FREE_RPC_URLS, ...PAID_RPC_URLS] } },
 });
 
-export const publicClient = createPublicClient({ chain: robinhood, transport: http(robinhood.rpcUrls.default.http[0]) });
+const rpcStats = {
+  free: { success: 0, failure: 0 },
+  paid: { success: 0, failure: 0 },
+};
+const transport = fallback([
+  ...FREE_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-free-${index}`, name: `RamenPad Free RPC ${index + 1}` })),
+  ...PAID_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-paid-${index}`, name: `RamenPad Paid RPC ${index + 1}` })),
+], { rank: false, retryCount: 0 });
+
+export const publicClient = createPublicClient({ chain: robinhood, transport });
+publicClient.transport.onResponse(({ status, transport: usedTransport }) => {
+  const tier = usedTransport.config.key.startsWith("ramenpad-paid-") ? "paid" : "free";
+  rpcStats[tier][status === "success" ? "success" : "failure"] += 1;
+});
+
+export function getRpcStats() {
+  return {
+    freeProviders: FREE_RPC_URLS.length,
+    paidProviders: PAID_RPC_URLS.length,
+    free: { ...rpcStats.free },
+    paid: { ...rpcStats.paid },
+  };
+}
 
 export function requiredAddress(name: string): Address {
   const value = process.env[name];

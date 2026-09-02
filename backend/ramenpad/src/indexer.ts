@@ -19,7 +19,7 @@ import {
 } from "./config.js";
 import type { Database } from "./db.js";
 import { priceFromSqrt } from "./math.js";
-import { getRamenUsd } from "./ramenPrice.js";
+import { getMarketPrices, getRamenUsd } from "./ramenPrice.js";
 
 interface PoolRow {
   token_address: Address;
@@ -42,7 +42,10 @@ export class RamenpadIndexer {
   private otc?: Address;
   private locker?: Address;
   private timer?: NodeJS.Timeout;
+  private marketTimer?: NodeJS.Timeout;
   private currentTick?: Promise<void>;
+  private repricing = false;
+  private lastRamenUsd = 0;
   private consecutiveFailures = 0;
   private readonly intervalMs = Math.max(5_000, Number(process.env.RAMENPAD_INDEXER_INTERVAL_MS) || 15_000);
   private readonly maxBackoffMs = Math.max(this.intervalMs, Number(process.env.RAMENPAD_INDEXER_MAX_BACKOFF_MS) || 120_000);
@@ -56,13 +59,37 @@ export class RamenpadIndexer {
     ]);
     await this.loadPools();
     await this.runTick();
+    await this.repriceMarkets();
+    this.marketTimer = setInterval(() => void this.repriceMarkets(), 30_000);
     this.schedule();
   }
 
   async stop() {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    if (this.marketTimer) clearInterval(this.marketTimer);
     await this.currentTick;
+  }
+
+  private async repriceMarkets() {
+    if (this.repricing || this.stopped) return;
+    this.repricing = true;
+    try {
+      const { ramenUsd, ethUsd, ramenMarketCapUsd, ramenVolumeUsd } = await getMarketPrices();
+      if (ramenUsd === this.lastRamenUsd) return;
+      await this.db.query(`
+        UPDATE ramenpad.launches SET
+          price_ramen=COALESCE(NULLIF(price_ramen,0),price_usd/$1),
+          price_usd=COALESCE(NULLIF(price_ramen,0),price_usd/$1)*$1,
+          market_cap_usd=COALESCE(NULLIF(price_ramen,0),price_usd/$1)*$1*$2
+      `, [ramenUsd, TOTAL_SUPPLY]);
+      this.lastRamenUsd = ramenUsd;
+      this.io.emit("ramenpad:market", { ramenUsd, ethUsd, ramenMarketCapUsd, ramenVolumeUsd });
+    } catch (error) {
+      console.error("[ramenpad:market]", error);
+    } finally {
+      this.repricing = false;
+    }
   }
 
   private runTick() {
@@ -155,21 +182,26 @@ export class RamenpadIndexer {
     const token1 = token0 === token ? RAMEN : token;
     const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
     const launchedAt = new Date(Number(block.timestamp) * 1000);
-    const launchMarketCapUsd = log.blockNumber >= TARGET_2000_ACTIVATION_BLOCK
+    const targetMarketCapUsd = log.blockNumber >= TARGET_2000_ACTIVATION_BLOCK
       ? TARGET_MARKET_CAP_USD
       : LEGACY_TARGET_MARKET_CAP_USD;
-    const launchPriceUsd = launchMarketCapUsd / TOTAL_SUPPLY;
+    const ramenUsd = await getRamenUsd();
+    const tokenIsToken0 = token0.toLowerCase() === token.toLowerCase();
+    const launchPrice = priceFromSqrt(args.sqrtPriceX96, tokenIsToken0, ramenUsd);
+    const launchPriceRamen = launchPrice.ramenPerToken;
+    const launchPriceUsd = launchPrice.priceUsd || targetMarketCapUsd / TOTAL_SUPPLY;
+    const launchMarketCapUsd = launchPriceUsd * TOTAL_SUPPLY;
     const result = await this.db.query(`
       INSERT INTO ramenpad.launches(
         token_address,pool_address,launcher,position_token_id,name,symbol,image_url,token0,token1,
-        sqrt_price_x96,tick_lower,tick_upper,launch_tx,launch_block,launched_at,price_usd,market_cap_usd
-      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        sqrt_price_x96,tick_lower,tick_upper,launch_tx,launch_block,launched_at,price_ramen,price_usd,market_cap_usd
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       ON CONFLICT(token_address) DO NOTHING RETURNING *
     `, [
       token.toLowerCase(), pool.toLowerCase(), args.launcher.toLowerCase(), args.positionTokenId.toString(),
       args.name, args.symbol, args.imageUrl, token0.toLowerCase(), token1.toLowerCase(), args.sqrtPriceX96.toString(),
       args.tickLower, args.tickUpper, log.transactionHash.toLowerCase(), log.blockNumber.toString(), launchedAt,
-      launchPriceUsd, launchMarketCapUsd,
+      launchPriceRamen, launchPriceUsd, launchMarketCapUsd,
     ]);
     const row: PoolRow = { token_address: token, pool_address: pool, token0, token1, symbol: args.symbol };
     this.pools.set(pool.toLowerCase(), row);
@@ -187,7 +219,7 @@ export class RamenpadIndexer {
     const pool = this.pools.get(log.address.toLowerCase());
     if (!pool) return;
     const args = log.args as { recipient: Address; amount0: bigint; amount1: bigint; sqrtPriceX96: bigint };
-    if (this.otc && args.recipient.toLowerCase() === this.otc.toLowerCase()) return;
+    const routedPoolLeg = Boolean(this.otc && args.recipient.toLowerCase() === this.otc.toLowerCase());
     const tokenIsToken0 = pool.token0.toLowerCase() === pool.token_address.toLowerCase();
     const tokenDelta = tokenIsToken0 ? args.amount0 : args.amount1;
     const ramenDelta = tokenIsToken0 ? args.amount1 : args.amount0;
@@ -195,8 +227,18 @@ export class RamenpadIndexer {
     const tokenAmount = formatUnits(tokenDelta < 0n ? -tokenDelta : tokenDelta, 18);
     const ramenAmount = formatUnits(ramenDelta < 0n ? -ramenDelta : ramenDelta, 18);
     const ramenUsd = await getRamenUsd();
-    const { priceUsd } = priceFromSqrt(args.sqrtPriceX96, tokenIsToken0, ramenUsd);
+    const { priceUsd, ramenPerToken } = priceFromSqrt(args.sqrtPriceX96, tokenIsToken0, ramenUsd);
     const marketCapUsd = priceUsd * TOTAL_SUPPLY;
+    if (routedPoolLeg) {
+      await this.db.query(`
+        UPDATE ramenpad.launches SET sqrt_price_x96=$2, price_ramen=$3, price_usd=$4, market_cap_usd=$5
+        WHERE token_address=$1
+      `, [pool.token_address.toLowerCase(), args.sqrtPriceX96.toString(), ramenPerToken, priceUsd, marketCapUsd]);
+      this.io.emit("ramenpad:tokens:update", {
+        tokenAddress: pool.token_address, priceUsd, marketCapUsd, volumeDeltaUsd: 0,
+      });
+      return;
+    }
     const usdValue = Number(ramenAmount) * ramenUsd;
     const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
     const blockTime = new Date(Number(block.timestamp) * 1000);
@@ -214,9 +256,10 @@ export class RamenpadIndexer {
     ]);
     if (!result.rowCount) return;
     await this.db.query(`
-      UPDATE ramenpad.launches SET price_usd=$2, market_cap_usd=$3, volume_usd=volume_usd+$4
+      UPDATE ramenpad.launches SET sqrt_price_x96=$2, price_ramen=$3, price_usd=$4,
+        market_cap_usd=$5, volume_usd=volume_usd+$6
       WHERE token_address=$1
-    `, [pool.token_address.toLowerCase(), priceUsd, marketCapUsd, usdValue]);
+    `, [pool.token_address.toLowerCase(), args.sqrtPriceX96.toString(), ramenPerToken, priceUsd, marketCapUsd, usdValue]);
     this.io.emit("ramenpad:trade", {
       id, tokenAddress: pool.token_address, poolAddress: pool.pool_address, symbol: pool.symbol,
       side, trader: args.recipient, tokenAmount, ramenAmount, usdValue, priceUsd, marketCapUsd,
@@ -242,7 +285,8 @@ export class RamenpadIndexer {
     const tokenAmount = formatUnits(tokenRaw, 18);
     const ramenAmount = formatUnits(ramenRaw, 18);
     const ramenUsd = await getRamenUsd();
-    const priceUsd = Number(tokenAmount) === 0 ? 0 : Number(ramenAmount) * ramenUsd / Number(tokenAmount);
+    const priceRamen = Number(tokenAmount) === 0 ? 0 : Number(ramenAmount) / Number(tokenAmount);
+    const priceUsd = priceRamen * ramenUsd;
     const marketCapUsd = priceUsd * TOTAL_SUPPLY;
     const usdValue = Number(ramenAmount) * ramenUsd;
     const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
@@ -261,9 +305,9 @@ export class RamenpadIndexer {
     ]);
     if (!result.rowCount) return;
     await this.db.query(`
-      UPDATE ramenpad.launches SET price_usd=$2, market_cap_usd=$3, volume_usd=volume_usd+$4
+      UPDATE ramenpad.launches SET price_ramen=$2, price_usd=$3, market_cap_usd=$4, volume_usd=volume_usd+$5
       WHERE token_address=$1
-    `, [pool.token_address.toLowerCase(), priceUsd, marketCapUsd, usdValue]);
+    `, [pool.token_address.toLowerCase(), priceRamen, priceUsd, marketCapUsd, usdValue]);
     const trade = {
       id, tokenAddress: pool.token_address, poolAddress: pool.pool_address, symbol: pool.symbol,
       side: args.isBuy ? "buy" : "sell", trader: args.recipient, tokenAmount, ramenAmount,

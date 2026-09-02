@@ -1,11 +1,16 @@
-import { defineChain, http } from "viem";
+import { defineChain, fallback, http } from "viem";
+
+export const PUBLIC_RPC_URLS = [
+  "https://robinhood-rpc.publicnode.com",
+  "https://rpc.mainnet.chain.robinhood.com",
+] as const;
 
 export const robinhood = defineChain({
   id: 4663,
   name: "Robinhood Chain",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   rpcUrls: {
-    default: { http: ["https://rpc.mainnet.chain.robinhood.com"] },
+    default: { http: [...PUBLIC_RPC_URLS] },
   },
   blockExplorers: {
     default: { name: "Robinhood Chain Explorer", url: "https://robinhoodchain.blockscout.com" },
@@ -15,10 +20,14 @@ export const robinhood = defineChain({
   },
 });
 
-export const transport = http(robinhood.rpcUrls.default.http[0]);
+export const transport = fallback(
+  PUBLIC_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-browser-free-${index}` })),
+  { rank: false, retryCount: 0 },
+);
 export const API_URL = (import.meta.env.VITE_API_URL || "https://api.yougotcoined.com/api/ramenpad").replace(/\/$/, "");
 export const LAUNCHER = (import.meta.env.VITE_RAMENPAD_LAUNCHER_ADDRESS || "0xC89f3837895b3e02c54F254eD73D580016Bbd3E7") as `0x${string}`;
 export const ETH_ROUTER = (import.meta.env.VITE_RAMENPAD_ETH_ROUTER_ADDRESS || "0x04231d4EBa71Fd75C3e124E9b332BBB445FA076e") as `0x${string}`;
+export const OTC = (import.meta.env.VITE_RAMENPAD_OTC_ADDRESS || "0x76B480be19abe121907Aaa5028F52462C8F2F8b5") as `0x${string}`;
 export const RAMEN = "0xe013e34F03F42d49E836d59CF6353B897c337777" as const;
 export const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" as const;
 export const V2_ROUTER = "0x89e5DB8B5aA49aA85AC63f691524311AEB649eba" as const;
