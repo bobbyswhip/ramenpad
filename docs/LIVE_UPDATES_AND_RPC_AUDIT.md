@@ -4,12 +4,13 @@ Date: 2026-09-02
 
 ## Delivery model
 
-RamenPad uses a durable two-stage live-data pipeline:
+RamenPad uses a durable three-stage live-data pipeline:
 
-1. The backend polls confirmed Robinhood blocks every 15 seconds, indexes through head minus two blocks, and stores an idempotent cursor in PostgreSQL. Failures back off exponentially to 120 seconds.
-2. The backend immediately pushes indexed launches, trades, terminal pool prices, RAMEN-market repricing, and fee events to browsers over Socket.IO WebSocket (with HTTP long-poll fallback).
+1. An authenticated backend-only Alchemy WebSocket subscribes to exact RamenPad system events and `Swap` events from pool-address shards. Events wait for the configured two-block depth before materialization.
+2. A free-HTTP-first reconciliation scan runs every ten minutes and on every startup/reconnect. It stores an idempotent contiguous cursor in PostgreSQL; paid Alchemy HTTP is only the final fallback.
+3. The backend immediately pushes indexed launches, trades, terminal pool prices, RAMEN-market repricing, and fee events to browsers over Socket.IO WebSocket (with HTTP long-poll fallback).
 
-The block poller is intentional. It can recover every missed log after a restart or provider interruption; a bare RPC WebSocket subscription cannot provide that guarantee by itself. Browser reconnects now trigger a complete API snapshot resync, closing any delivery gap while the tab was offline.
+The recovery scanner remains intentional. It recovers every missed log after a restart or provider interruption; the WebSocket supplies latency but is never treated as the completeness checkpoint. Browser reconnects trigger a complete API snapshot resync, closing any delivery gap while the tab was offline.
 
 ## Price correctness changes
 
@@ -33,7 +34,7 @@ Backend reads use ordered failover without latency ranking, so a paid request ca
 
 Confirmed historical catch-up uses the capability-specific `ROBINHOOD_LOG_RPC_URLS` path because tokenless PublicNode rejects archive `eth_getLogs` requests. Each query combines the launcher, locker, and swapper addresses, while pool swaps are grouped in batches of up to 100 addresses. Failed log queries use bounded exponential retries and never advance the cursor.
 
-Free-only catch-up processes one 1,000-block range per tick; this is safely faster than chain growth without producing a burst of per-address requests. Paid-backed indexing defaults to twenty 1,000-block ranges per tick. `RAMENPAD_INDEXER_BLOCK_RANGE` and `RAMENPAD_INDEXER_RANGES_PER_TICK` can override either mode.
+Free-only catch-up processes 1,000-block ranges without producing per-address request bursts. If every free log request fails, the Alchemy free-tier fallback is split into ten-block requests to respect its range limit. `RAMENPAD_INDEXER_BLOCK_RANGE`, `RAMENPAD_INDEXER_RANGES_PER_TICK`, and `RAMENPAD_PAID_LOG_BLOCK_RANGE` control these bounds.
 
 The cursor is committed only after every watched contract in a range has been processed successfully. Launch, trade, and fee rows use conflict-safe event identities, so service restarts resume from the next uncommitted block without gaps or duplicates.
 
@@ -51,4 +52,4 @@ The health endpoint exposes aggregate success/failure counters by free or paid t
 
 This keeps authenticated/premium RPC credentials off the browser and ensures normal indexing consumes the free tier first. Paid service is failover capacity, not the steady-state path.
 
-The approved WebSocket-first scale-out design and its migration plan are documented in [Scalable live indexing architecture](SCALABLE_INDEXING_ARCHITECTURE.md). The polling behavior above describes the currently deployed recovery-safe implementation until that staged migration is completed.
+The complete scale-out design and remaining persistence/HA phases are documented in [Scalable live indexing architecture](SCALABLE_INDEXING_ARCHITECTURE.md).

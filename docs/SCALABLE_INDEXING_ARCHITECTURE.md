@@ -1,6 +1,6 @@
 # Scalable live indexing architecture
 
-Status: approved design, not yet the production implementation  
+Status: hybrid WebSocket/reconciliation core deployed; raw inbox/outbox and multi-instance HA phases remain
 Date: 2026-09-02
 
 ## Decision
@@ -260,3 +260,23 @@ The implementation is complete only after these tests pass:
 - Load-test at 100, 1,000, and 10,000 registered pools and record RPC calls, bandwidth, queue lag, and database latency.
 
 Production cutover requires zero missing identities between shadow WebSocket input and reconciliation over the observation window.
+
+## Current implementation status
+
+Deployed on 2026-09-02:
+
+- Backend-only Alchemy WebSocket with automatic reconnect and keepalive.
+- Exact system-event filtering and Uniswap v3 pool subscriptions sharded by address.
+- Two-block in-memory confirmation and canonical log ordering.
+- Overlapping pool-subscription replacement plus launch-block replay for a new pool's atomic first swap.
+- Ten-minute free-HTTP-first reconciliation and startup/reconnect backfill.
+- Ten-block authenticated Alchemy HTTP fallback after bounded free-RPC retries.
+- Persistent onchain launch IDs and `launchCount()` versus database-count audits.
+- Hybrid health/readiness fields and frontend launch gating.
+
+Still staged for a later multi-instance phase:
+
+- The durable raw-log inbox and transactional Socket.IO outbox.
+- Automated materialized-state rollback for deep reorganizations.
+- PostgreSQL advisory leader election and standby indexer failover.
+- Redis Socket.IO fan-out for multiple API nodes.

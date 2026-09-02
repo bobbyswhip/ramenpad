@@ -1,4 +1,4 @@
-import { defineChain, fallback, http, createPublicClient, type Address, type Hex } from "viem";
+import { defineChain, fallback, http, webSocket, createPublicClient, type Address, type Hex } from "viem";
 
 export const CHAIN_ID = 4663;
 export const RAMEN = "0xe013e34F03F42d49E836d59CF6353B897c337777" as Address;
@@ -30,6 +30,7 @@ export const PAID_RPC_URLS = unique([
   ...urls(process.env.ROBINHOOD_PAID_RPC_URLS),
   ...urls(process.env.ROBINHOOD_PAID_RPC_URL),
 ]).filter((url) => !FREE_RPC_URLS.includes(url));
+export const WS_RPC_URL = process.env.ROBINHOOD_WS_URL?.trim() || "";
 
 export const robinhood = defineChain({
   id: CHAIN_ID,
@@ -53,11 +54,24 @@ const logFreeRpcUrls = unique([
 ]);
 const logTransport = fallback([
   ...logFreeRpcUrls.map((url, index) => http(url, { key: `ramenpad-log-free-${index}`, name: `RamenPad Log RPC ${index + 1}` })),
-  ...PAID_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-log-paid-${index}`, name: `RamenPad Paid Log RPC ${index + 1}` })),
 ], { rank: false, retryCount: 0 });
+const paidTransport = PAID_RPC_URLS.length ? fallback(
+  PAID_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-paid-${index}`, name: `RamenPad Paid RPC ${index + 1}` })),
+  { rank: false, retryCount: 0 },
+) : undefined;
 
 export const publicClient = createPublicClient({ chain: robinhood, transport });
 export const logClient = createPublicClient({ chain: robinhood, transport: logTransport });
+export const paidClient = paidTransport ? createPublicClient({ chain: robinhood, transport: paidTransport }) : undefined;
+export const liveClient = WS_RPC_URL ? createPublicClient({
+  chain: robinhood,
+  transport: webSocket(WS_RPC_URL, {
+    keepAlive: { interval: 20_000 },
+    reconnect: { attempts: 20, delay: 2_000 },
+    retryCount: 2,
+    timeout: 15_000,
+  }),
+}) : undefined;
 publicClient.transport.onResponse(({ status, transport: usedTransport }) => {
   const tier = usedTransport.config.key.includes("-paid-") ? "paid" : "free";
   rpcStats[tier][status === "success" ? "success" : "failure"] += 1;
@@ -66,11 +80,15 @@ logClient.transport.onResponse(({ status, transport: usedTransport }) => {
   const tier = usedTransport.config.key.includes("-paid-") ? "paid" : "free";
   rpcStats[tier][status === "success" ? "success" : "failure"] += 1;
 });
+paidClient?.transport.onResponse(({ status }) => {
+  rpcStats.paid[status === "success" ? "success" : "failure"] += 1;
+});
 
 export function getRpcStats() {
   return {
     freeProviders: FREE_RPC_URLS.length,
     paidProviders: PAID_RPC_URLS.length,
+    websocketConfigured: Boolean(WS_RPC_URL),
     free: { ...rpcStats.free },
     paid: { ...rpcStats.paid },
   };

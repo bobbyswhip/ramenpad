@@ -7,11 +7,14 @@ import {
   otcSwapEvent,
   protocolFeesDepositedEvent,
   swapEvent,
+  tokenLaunchedEvent,
 } from "./abi.js";
 import {
   LEGACY_TARGET_MARKET_CAP_USD,
+  liveClient,
   logClient,
   PAID_RPC_URLS,
+  paidClient,
   publicClient,
   RAMEN,
   requiredAddress,
@@ -53,6 +56,38 @@ async function withLogRetry<T>(request: () => Promise<T>) {
   throw lastError;
 }
 
+export function splitBlockRange(fromBlock: bigint, toBlock: bigint, size: bigint) {
+  if (size <= 0n) throw new Error("Block range size must be positive");
+  const ranges: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+  for (let from = fromBlock; from <= toBlock; from += size) {
+    ranges.push({ fromBlock: from, toBlock: from + size - 1n < toBlock ? from + size - 1n : toBlock });
+  }
+  return ranges;
+}
+
+async function getLogsWithFallback<T>(
+  fromBlock: bigint,
+  toBlock: bigint,
+  freeRequest: () => Promise<T[]>,
+  paidRequest?: (from: bigint, to: bigint) => Promise<T[]>,
+) {
+  try {
+    return await withLogRetry(freeRequest);
+  } catch (freeError) {
+    if (!paidRequest) throw freeError;
+    console.warn("[ramenpad:indexer] free log RPC unavailable; using bounded paid fallback");
+    const configuredRange = Number(process.env.RAMENPAD_PAID_LOG_BLOCK_RANGE);
+    const paidRange = BigInt(Number.isFinite(configuredRange) && configuredRange > 0
+      ? Math.floor(configuredRange)
+      : 10);
+    const logs: T[] = [];
+    for (const range of splitBlockRange(fromBlock, toBlock, paidRange)) {
+      logs.push(...await withLogRetry(() => paidRequest(range.fromBlock, range.toBlock)));
+    }
+    return logs;
+  }
+}
+
 export class RamenpadIndexer {
   private stopped = false;
   private running = false;
@@ -62,7 +97,16 @@ export class RamenpadIndexer {
   private locker?: Address;
   private timer?: NodeJS.Timeout;
   private marketTimer?: NodeJS.Timeout;
+  private liveHealthTimer?: NodeJS.Timeout;
+  private liveDrainTimer?: NodeJS.Timeout;
   private currentTick?: Promise<void>;
+  private currentLiveRecovery?: Promise<void>;
+  private poolRefresh: Promise<void> = Promise.resolve();
+  private unwatchSystem?: () => void;
+  private unwatchPools: Array<() => void> = [];
+  private liveBuffer = new Map<string, Log>();
+  private liveDraining = false;
+  private blockTimes = new Map<bigint, Date>();
   private repricing = false;
   private lastRamenUsd = 0;
   private consecutiveFailures = 0;
@@ -70,8 +114,15 @@ export class RamenpadIndexer {
   private lastSuccessfulTickAt?: Date;
   private lastIndexedBlock?: bigint;
   private safeHead?: bigint;
-  private readonly intervalMs = Math.max(5_000, Number(process.env.RAMENPAD_INDEXER_INTERVAL_MS) || 15_000);
-  private readonly maxBackoffMs = Math.max(this.intervalMs, Number(process.env.RAMENPAD_INDEXER_MAX_BACKOFF_MS) || 120_000);
+  private wsConnected = false;
+  private wsLastHealthyAt?: Date;
+  private poolShardCount = 0;
+  private readonly confirmationBlocks = BigInt(Math.max(2, Number(process.env.RAMENPAD_CONFIRMATION_BLOCKS) || 2));
+  private readonly poolShardSize = Math.max(1, Number(process.env.RAMENPAD_WS_POOL_SHARD_SIZE) || 100);
+  private readonly intervalMs = liveClient
+    ? Math.max(60_000, Number(process.env.RAMENPAD_RECONCILE_INTERVAL_MS) || 600_000)
+    : Math.max(5_000, Number(process.env.RAMENPAD_INDEXER_INTERVAL_MS) || 15_000);
+  private readonly maxBackoffMs = Math.max(15_000, Number(process.env.RAMENPAD_INDEXER_MAX_BACKOFF_MS) || 120_000);
 
   constructor(private db: Database, private io: SocketServer) {}
 
@@ -82,9 +133,12 @@ export class RamenpadIndexer {
     ]);
     await this.loadPools();
     await this.repairLaunchTimestamps();
+    await this.repairLaunchIds();
+    if (liveClient) await this.startLiveSubscriptions();
     await this.runTick();
     await this.repriceMarkets();
     this.marketTimer = setInterval(() => void this.repriceMarkets(), 30_000);
+    if (liveClient) this.liveHealthTimer = setInterval(() => void this.checkLiveHealth(), 30_000);
     this.schedule();
   }
 
@@ -92,14 +146,26 @@ export class RamenpadIndexer {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     if (this.marketTimer) clearInterval(this.marketTimer);
+    if (this.liveHealthTimer) clearInterval(this.liveHealthTimer);
+    if (this.liveDrainTimer) clearTimeout(this.liveDrainTimer);
+    this.unwatchSystem?.();
+    for (const unwatch of this.unwatchPools) unwatch();
     await this.currentTick;
+    await this.currentLiveRecovery;
   }
 
   getStatus() {
     return {
-      ready: this.caughtUp && !this.stopped && this.consecutiveFailures === 0,
+      ready: this.caughtUp && (!liveClient || this.wsConnected) && !this.stopped && this.consecutiveFailures === 0,
+      mode: liveClient ? "hybrid" : "polling",
       caughtUp: this.caughtUp,
       running: this.running,
+      wsConfigured: Boolean(liveClient),
+      wsConnected: this.wsConnected,
+      wsLastHealthyAt: this.wsLastHealthyAt?.toISOString() || null,
+      poolShardsReady: this.wsConnected ? this.poolShardCount : 0,
+      poolShardsExpected: this.poolShardCount,
+      liveQueueDepth: this.liveBuffer.size,
       lastSuccessfulTickAt: this.lastSuccessfulTickAt?.toISOString() || null,
       lastIndexedBlock: this.lastIndexedBlock?.toString() || null,
       safeHead: this.safeHead?.toString() || null,
@@ -137,7 +203,9 @@ export class RamenpadIndexer {
 
   private schedule() {
     if (this.stopped) return;
-    const delay = Math.min(this.intervalMs * (2 ** this.consecutiveFailures), this.maxBackoffMs);
+    const delay = this.consecutiveFailures
+      ? Math.min(15_000 * (2 ** this.consecutiveFailures), this.maxBackoffMs)
+      : this.intervalMs;
     this.timer = setTimeout(async () => {
       await this.runTick();
       this.schedule();
@@ -164,12 +232,181 @@ export class RamenpadIndexer {
     }
   }
 
+  private async repairLaunchIds() {
+    const missing = await this.db.query<{ token_address: string }>(
+      "SELECT token_address FROM ramenpad.launches WHERE launch_id IS NULL",
+    );
+    if (!missing.rowCount) return;
+    const missingTokens = new Set(missing.rows.map((row) => row.token_address.toLowerCase()));
+    const length = await publicClient.readContract({
+      address: this.launcher, abi: launcherAbi, functionName: "allTokensLength",
+    });
+    for (let index = 0n; index < length && missingTokens.size; index += 1n) {
+      const token = await publicClient.readContract({
+        address: this.launcher, abi: launcherAbi, functionName: "allTokens", args: [index],
+      });
+      if (!missingTokens.has(token.toLowerCase())) continue;
+      await this.db.query(
+        "UPDATE ramenpad.launches SET launch_id=$2 WHERE token_address=$1 AND launch_id IS NULL",
+        [token.toLowerCase(), index.toString()],
+      );
+      missingTokens.delete(token.toLowerCase());
+    }
+  }
+
+  private async auditLaunchRegistry() {
+    const [chainCount, database] = await Promise.all([
+      publicClient.readContract({ address: this.launcher, abi: launcherAbi, functionName: "launchCount" }),
+      this.db.query<{ count: string }>("SELECT count(*)::text AS count FROM ramenpad.launches"),
+    ]);
+    if (BigInt(database.rows[0]?.count || 0) !== chainCount) {
+      throw new Error("Onchain launch registry and indexed launch count differ");
+    }
+  }
+
+  private liveError(error: Error) {
+    if (this.stopped) return;
+    this.wsConnected = false;
+    console.error(`[ramenpad:ws] subscription degraded (${error.name || "Error"})`);
+    void this.recoverLiveSubscriptions();
+  }
+
+  private receiveLiveLogs(logs: readonly Log[]) {
+    if (this.stopped) return;
+    this.wsConnected = true;
+    this.wsLastHealthyAt = new Date();
+    for (const log of logs) {
+      if (log.blockNumber === null || log.transactionHash === null || log.logIndex === null) continue;
+      const key = `${log.blockHash || "pending"}:${log.transactionHash}:${log.logIndex}`.toLowerCase();
+      if (log.removed) {
+        this.liveBuffer.delete(key);
+        continue;
+      }
+      this.liveBuffer.set(key, log);
+    }
+    this.scheduleLiveDrain();
+  }
+
+  private scheduleLiveDrain(delayMs = 500) {
+    if (this.liveDrainTimer || this.stopped) return;
+    this.liveDrainTimer = setTimeout(() => {
+      this.liveDrainTimer = undefined;
+      void this.drainLiveBuffer();
+    }, delayMs);
+  }
+
+  private async drainLiveBuffer() {
+    if (this.liveDraining || this.stopped || !this.liveBuffer.size) return;
+    this.liveDraining = true;
+    try {
+      const head = await publicClient.getBlockNumber();
+      const safeHead = head > this.confirmationBlocks ? head - this.confirmationBlocks : head;
+      const ready = [...this.liveBuffer.entries()]
+        .filter(([, log]) => log.blockNumber !== null && log.blockNumber <= safeHead)
+        .sort(([, left], [, right]) => Number((left.blockNumber || 0n) - (right.blockNumber || 0n))
+          || Number((left.transactionIndex || 0) - (right.transactionIndex || 0))
+          || Number((left.logIndex || 0) - (right.logIndex || 0)));
+      for (const [key, log] of ready) {
+        const address = log.address.toLowerCase();
+        if (address === this.launcher.toLowerCase()
+          || address === this.locker?.toLowerCase()
+          || address === this.otc?.toLowerCase()) {
+          await this.indexSystemLog(log);
+        } else if (this.pools.has(address)) {
+          await this.indexSwap(log as never);
+        }
+        this.liveBuffer.delete(key);
+      }
+      this.wsLastHealthyAt = new Date();
+    } catch (error) {
+      this.caughtUp = false;
+      this.consecutiveFailures += 1;
+      const name = error instanceof Error ? error.name : "Error";
+      console.error(`[ramenpad:ws] live materialization failed (${name})`);
+      void this.runTick();
+    } finally {
+      this.liveDraining = false;
+      if (this.liveBuffer.size) this.scheduleLiveDrain(500);
+    }
+  }
+
+  private async startLiveSubscriptions() {
+    if (!liveClient || this.stopped) return;
+    const chainId = await liveClient.getChainId();
+    if (chainId !== 4663) throw new Error("WebSocket provider returned the wrong chain ID");
+    const systemAddresses = [this.launcher, this.locker, this.otc].filter(Boolean) as Address[];
+    const nextSystem = liveClient.watchEvent({
+      address: systemAddresses,
+      events: [tokenLaunchedEvent, feesHarvestedEvent, launcherFeesClaimedEvent, protocolFeesDepositedEvent, otcSwapEvent],
+      strict: true,
+      onLogs: (logs) => this.receiveLiveLogs(logs as Log[]),
+      onError: (error) => this.liveError(error),
+    });
+    await this.replacePoolSubscriptions();
+    await delay(500);
+    const previousSystem = this.unwatchSystem;
+    this.unwatchSystem = nextSystem;
+    previousSystem?.();
+    this.wsConnected = true;
+    this.wsLastHealthyAt = new Date();
+    console.log(`[ramenpad:ws] live subscriptions ready (${this.poolShardCount} pool shards)`);
+  }
+
+  private async replacePoolSubscriptions() {
+    if (!liveClient || this.stopped) return;
+    const addresses = [...this.pools.values()].map((pool) => pool.pool_address);
+    const next: Array<() => void> = [];
+    for (let index = 0; index < addresses.length; index += this.poolShardSize) {
+      const batch = addresses.slice(index, index + this.poolShardSize);
+      next.push(liveClient.watchEvent({
+        address: batch,
+        event: swapEvent,
+        strict: true,
+        onLogs: (logs) => this.receiveLiveLogs(logs as Log[]),
+        onError: (error) => this.liveError(error),
+      }));
+    }
+    await delay(250);
+    const previous = this.unwatchPools;
+    this.unwatchPools = next;
+    this.poolShardCount = next.length;
+    for (const unwatch of previous) unwatch();
+  }
+
+  private recoverLiveSubscriptions() {
+    if (!liveClient || this.stopped) return Promise.resolve();
+    if (!this.currentLiveRecovery) {
+      this.currentLiveRecovery = (async () => {
+        await delay(2_000);
+        await this.startLiveSubscriptions();
+        await this.runTick();
+      })().catch((error) => {
+        const name = error instanceof Error ? error.name : "Error";
+        console.error(`[ramenpad:ws] reconnect failed (${name})`);
+        if (!this.stopped) setTimeout(() => void this.recoverLiveSubscriptions(), 10_000);
+      }).finally(() => { this.currentLiveRecovery = undefined; });
+    }
+    return this.currentLiveRecovery;
+  }
+
+  private async checkLiveHealth() {
+    if (!liveClient || this.stopped) return;
+    try {
+      const chainId = await liveClient.getChainId();
+      if (chainId !== 4663) throw new Error("wrong WebSocket chain ID");
+      if (!this.wsConnected) await this.recoverLiveSubscriptions();
+      else this.wsLastHealthyAt = new Date();
+    } catch (error) {
+      this.liveError(error instanceof Error ? error : new Error("WebSocket health check failed"));
+    }
+  }
+
   private async tick() {
     if (this.running || this.stopped) return;
     this.running = true;
     try {
       const chainHead = await publicClient.getBlockNumber();
-      const safeHead = chainHead > 2n ? chainHead - 2n : chainHead;
+      const safeHead = chainHead > this.confirmationBlocks ? chainHead - this.confirmationBlocks : chainHead;
       this.safeHead = safeHead;
       const state = await this.db.query<{ block_number: string }>("SELECT block_number FROM ramenpad.indexer_state WHERE worker='main'");
       const configuredStart = BigInt(process.env.RAMENPAD_DEPLOYMENT_BLOCK || safeHead.toString());
@@ -194,6 +431,7 @@ export class RamenpadIndexer {
         from = to + 1n;
         rangesProcessed += 1;
       }
+      await this.auditLaunchRegistry();
       this.caughtUp = from > safeHead;
       this.lastSuccessfulTickAt = new Date();
       this.consecutiveFailures = 0;
@@ -206,60 +444,105 @@ export class RamenpadIndexer {
 
   private async indexRange(fromBlock: bigint, toBlock: bigint) {
     const systemAddresses = [this.launcher, this.locker, this.otc].filter(Boolean) as Address[];
-    const systemLogs: Log[] = [];
-    systemLogs.push(...await withLogRetry(() => logClient.getLogs({ address: systemAddresses, fromBlock, toBlock })));
-    for (const log of systemLogs) {
-      const address = log.address.toLowerCase();
-      if (address === this.launcher.toLowerCase()) {
-        let decoded;
-        try { decoded = decodeEventLog({ abi: launcherAbi, data: log.data, topics: log.topics }); }
-        catch { continue; }
-        if (decoded.eventName === "TokenLaunched") await this.indexLaunch({ ...log, ...decoded } as never);
-      } else if (this.locker && address === this.locker.toLowerCase()) {
-        let decoded;
-        try {
-          decoded = decodeEventLog({
-            abi: [feesHarvestedEvent, launcherFeesClaimedEvent, protocolFeesDepositedEvent],
-            data: log.data,
-            topics: log.topics,
-          });
-        } catch { continue; }
-        if (decoded.eventName === "FeesHarvested") await this.indexFeeHarvest({ ...log, ...decoded } as never);
-        else if (decoded.eventName === "LauncherFeesClaimed") await this.indexFeeClaim({ ...log, ...decoded } as never);
-        else if (decoded.eventName === "ProtocolFeesDeposited") await this.indexProtocolFeeDeposit({ ...log, ...decoded } as never);
-      } else if (this.otc && address === this.otc.toLowerCase()) {
-        let decoded;
-        try { decoded = decodeEventLog({ abi: [otcSwapEvent], data: log.data, topics: log.topics }); }
-        catch { continue; }
-        if (decoded.eventName === "OtcSwap") await this.indexOtcSwap({ ...log, ...decoded } as never);
-      }
-    }
+    const paidLogs = paidClient;
+    const systemLogs = await getLogsWithFallback(
+      fromBlock,
+      toBlock,
+      () => logClient.getLogs({ address: systemAddresses, fromBlock, toBlock }),
+      paidLogs ? (from, to) => paidLogs.getLogs({ address: systemAddresses, fromBlock: from, toBlock: to }) : undefined,
+    );
+    for (const log of systemLogs) await this.indexSystemLog(log);
 
     const addresses = [...this.pools.values()].map((pool) => pool.pool_address);
     for (let index = 0; index < addresses.length; index += 100) {
       const batch = addresses.slice(index, index + 100);
-      const logs: Log[] = [];
-      logs.push(...await withLogRetry(() => logClient.getLogs({
-        address: batch, event: swapEvent, fromBlock, toBlock, strict: true,
-      })));
+      const logs = await getLogsWithFallback(
+        fromBlock,
+        toBlock,
+        () => logClient.getLogs({ address: batch, event: swapEvent, fromBlock, toBlock, strict: true }),
+        paidLogs ? (from, to) => paidLogs.getLogs({
+          address: batch, event: swapEvent, fromBlock: from, toBlock: to, strict: true,
+        }) : undefined,
+      );
       for (const log of logs) await this.indexSwap(log as never);
     }
   }
 
+  private async indexSystemLog(log: Log) {
+    const address = log.address.toLowerCase();
+    if (address === this.launcher.toLowerCase()) {
+      let decoded;
+      try { decoded = decodeEventLog({ abi: launcherAbi, data: log.data, topics: log.topics }); }
+      catch { return; }
+      if (decoded.eventName === "TokenLaunched") await this.indexLaunch({ ...log, ...decoded } as never);
+    } else if (this.locker && address === this.locker.toLowerCase()) {
+      let decoded;
+      try {
+        decoded = decodeEventLog({
+          abi: [feesHarvestedEvent, launcherFeesClaimedEvent, protocolFeesDepositedEvent],
+          data: log.data,
+          topics: log.topics,
+        });
+      } catch { return; }
+      if (decoded.eventName === "FeesHarvested") await this.indexFeeHarvest({ ...log, ...decoded } as never);
+      else if (decoded.eventName === "LauncherFeesClaimed") await this.indexFeeClaim({ ...log, ...decoded } as never);
+      else if (decoded.eventName === "ProtocolFeesDeposited") await this.indexProtocolFeeDeposit({ ...log, ...decoded } as never);
+    } else if (this.otc && address === this.otc.toLowerCase()) {
+      let decoded;
+      try { decoded = decodeEventLog({ abi: [otcSwapEvent], data: log.data, topics: log.topics }); }
+      catch { return; }
+      if (decoded.eventName === "OtcSwap") await this.indexOtcSwap({ ...log, ...decoded } as never);
+    }
+  }
+
   private async blockTime(log: { blockNumber: bigint }) {
+    const cached = this.blockTimes.get(log.blockNumber);
+    if (cached) return cached;
     const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    return new Date(Number(block.timestamp) * 1000);
+    const value = new Date(Number(block.timestamp) * 1000);
+    this.blockTimes.set(log.blockNumber, value);
+    if (this.blockTimes.size > 512) {
+      const oldest = this.blockTimes.keys().next().value;
+      if (oldest !== undefined) this.blockTimes.delete(oldest);
+    }
+    return value;
+  }
+
+  private refreshPoolSubscription(pool: Address, launchBlock: bigint) {
+    this.poolRefresh = this.poolRefresh.then(async () => {
+      const paidLogs = paidClient;
+      await this.replacePoolSubscriptions();
+      const head = await publicClient.getBlockNumber();
+      const safeHead = head > this.confirmationBlocks ? head - this.confirmationBlocks : head;
+      if (launchBlock > safeHead) return;
+      const logs = await getLogsWithFallback(
+        launchBlock,
+        safeHead,
+        () => logClient.getLogs({ address: pool, event: swapEvent, fromBlock: launchBlock, toBlock: safeHead, strict: true }),
+        paidLogs ? (from, to) => paidLogs.getLogs({
+          address: pool, event: swapEvent, fromBlock: from, toBlock: to, strict: true,
+        }) : undefined,
+      );
+      for (const swap of logs) await this.indexSwap(swap as never);
+    }).catch((error) => {
+      const name = error instanceof Error ? error.name : "Error";
+      console.error(`[ramenpad:ws] pool subscription refresh failed (${name})`);
+      this.wsConnected = false;
+      void this.recoverLiveSubscriptions();
+    });
+    return this.poolRefresh;
   }
 
   private async indexLaunch(log: {
     args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
   }) {
     const args = log.args as {
-      token: Address; launcher: Address; pool: Address; positionTokenId: bigint;
+      launchId: bigint; token: Address; launcher: Address; pool: Address; positionTokenId: bigint;
       name: string; symbol: string; imageUrl: string; sqrtPriceX96: bigint; tickLower: number; tickUpper: number;
     };
     const token = getAddress(args.token);
     const pool = getAddress(args.pool);
+    const wasKnown = this.pools.has(pool.toLowerCase());
     const token0 = BigInt(token) < BigInt(RAMEN) ? token : RAMEN;
     const token1 = token0 === token ? RAMEN : token;
     const launchedAt = await this.blockTime(log);
@@ -274,18 +557,19 @@ export class RamenpadIndexer {
     const launchMarketCapUsd = launchPriceUsd * TOTAL_SUPPLY;
     const result = await this.db.query(`
       INSERT INTO ramenpad.launches(
-        token_address,pool_address,launcher,position_token_id,name,symbol,image_url,token0,token1,
+        token_address,pool_address,launcher,position_token_id,launch_id,name,symbol,image_url,token0,token1,
         sqrt_price_x96,tick_lower,tick_upper,launch_tx,launch_block,launched_at,price_ramen,price_usd,market_cap_usd
-      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT(token_address) DO NOTHING RETURNING *
     `, [
-      token.toLowerCase(), pool.toLowerCase(), args.launcher.toLowerCase(), args.positionTokenId.toString(),
+      token.toLowerCase(), pool.toLowerCase(), args.launcher.toLowerCase(), args.positionTokenId.toString(), args.launchId.toString(),
       args.name, args.symbol, args.imageUrl, token0.toLowerCase(), token1.toLowerCase(), args.sqrtPriceX96.toString(),
       args.tickLower, args.tickUpper, log.transactionHash.toLowerCase(), log.blockNumber.toString(), launchedAt,
       launchPriceRamen, launchPriceUsd, launchMarketCapUsd,
     ]);
     const row: PoolRow = { token_address: token, pool_address: pool, token0, token1, symbol: args.symbol };
     this.pools.set(pool.toLowerCase(), row);
+    if (liveClient && !wasKnown) await this.refreshPoolSubscription(pool, log.blockNumber);
     if (result.rowCount) this.io.emit("ramenpad:launch", {
       tokenAddress: token, poolAddress: pool, launcher: args.launcher,
       positionTokenId: args.positionTokenId.toString(), name: args.name, symbol: args.symbol,

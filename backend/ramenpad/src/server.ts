@@ -31,8 +31,15 @@ app.use("/api/ramenpad", createRamenpadRouter(db));
 app.get("/health/ramenpad", (_request, response) => {
   const indexerStatus = indexer?.getStatus() || {
     ready: false,
+    mode: "disabled",
     caughtUp: false,
     running: false,
+    wsConfigured: false,
+    wsConnected: false,
+    wsLastHealthyAt: null,
+    poolShardsReady: 0,
+    poolShardsExpected: 0,
+    liveQueueDepth: 0,
     lastSuccessfulTickAt: null,
     lastIndexedBlock: null,
     safeHead: null,

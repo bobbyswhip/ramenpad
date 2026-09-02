@@ -37,8 +37,11 @@ export async function migrate(db: Database) {
     );
     ALTER TABLE ramenpad.launches ADD COLUMN IF NOT EXISTS image_updated_at timestamptz;
     ALTER TABLE ramenpad.launches ADD COLUMN IF NOT EXISTS price_ramen numeric;
+    ALTER TABLE ramenpad.launches ADD COLUMN IF NOT EXISTS launch_id numeric(78,0);
     ALTER TABLE ramenpad.launches ALTER COLUMN price_usd SET DEFAULT (2000.0 / 6942000.0);
     ALTER TABLE ramenpad.launches ALTER COLUMN market_cap_usd SET DEFAULT 2000;
+    CREATE UNIQUE INDEX IF NOT EXISTS ramenpad_launches_launch_id
+      ON ramenpad.launches(launch_id) WHERE launch_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS ramenpad.trades (
       id text PRIMARY KEY,
