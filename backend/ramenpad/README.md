@@ -22,7 +22,7 @@ Copy the root `.env.example` values into this service's untracked `.env`. Set:
 - `RAMENPAD_KEEPER_PRIVATE_KEY` from `secrets/.env.backend`. This separate gas-only key has no admin role.
 - `RAMENPAD_KEEPER_INTERVAL_MS=600000`, `RAMENPAD_KEEPER_BATCH_SIZE=25`, and `RAMENPAD_KEEPER_MIN_HARVEST=1000` for the bounded ten-minute keeper.
 - `RAMENPAD_INDEXER_INTERVAL_MS=15000` and `RAMENPAD_INDEXER_MAX_BACKOFF_MS=120000` keep trade indexing responsive while backing off from public-RPC rate limits.
-- A production `DATABASE_URL`. RPCs are tried in explicit order: comma-separated `ROBINHOOD_FREE_RPC_URLS`, the legacy single free `ROBINHOOD_RPC_URL`, then comma-separated `ROBINHOOD_PAID_RPC_URLS`. Keep paid Alchemy/QuickNode endpoints only in the final list.
+- A production `DATABASE_URL`. Ordinary reads try comma-separated `ROBINHOOD_FREE_RPC_URLS`, the legacy single free `ROBINHOOD_RPC_URL`, then comma-separated `ROBINHOOD_PAID_RPC_URLS`. Confirmed historical log scans use `ROBINHOOD_LOG_RPC_URLS` before the same paid tier because tokenless PublicNode rejects archive log requests. Keep paid Alchemy/QuickNode endpoints only in the final list.
 - `PUBLIC_BASE_URL=https://api.yougotcoined.com` and the frontend CORS origin.
 
 The signer and keeper are deliberately separate from the funded owner/deployer. The signer can authorize a two-minute live-price quote. The keeper checks a bounded round-robin batch and only calls the permissionless locker harvest when combined collectible 18-decimal units are strictly above the configured threshold. Neither can deploy, transfer ownership, withdraw protocol positions, or move LP principal.

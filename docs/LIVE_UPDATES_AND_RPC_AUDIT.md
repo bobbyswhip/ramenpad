@@ -31,6 +31,12 @@ Backend reads use ordered failover without latency ranking, so a paid request ca
 2. `ROBINHOOD_RPC_URL` (legacy single free endpoint)
 3. `ROBINHOOD_PAID_RPC_URLS` (comma-separated, optional and last)
 
+Confirmed historical `eth_getLogs` scans use `ROBINHOOD_LOG_RPC_URLS` (the Robinhood public RPC by default) and then `ROBINHOOD_PAID_RPC_URLS`. This capability-specific route avoids sending archive queries to tokenless PublicNode, which rejects them, while keeping PublicNode first for inexpensive current-state reads.
+
+When no paid archive provider is configured, the indexer queries one watched contract per paced request because the public endpoint rate-limits multi-address historical scans. Once a paid provider is configured, it automatically switches to batches of up to 100 pools, retaining free-first failover without creating per-pool paid calls.
+
+Free-only catch-up uses one 100-block range per tick and spaces watched-address log requests by 1.2 seconds to stay below the public endpoint's historical-query and burst-rate ceilings. Paid-backed indexing defaults to twenty 1,000-block ranges per tick. `RAMENPAD_INDEXER_BLOCK_RANGE` and `RAMENPAD_INDEXER_RANGES_PER_TICK` can override those values.
+
 The health endpoint exposes aggregate success/failure counters by free or paid tier, never URLs or keys. A paid Robinhood Alchemy URL must be supplied explicitly; unrelated-chain Alchemy credentials must not be reused.
 
 ## Browser request budget

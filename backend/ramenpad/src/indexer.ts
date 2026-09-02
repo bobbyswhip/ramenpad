@@ -1,4 +1,4 @@
-import { decodeEventLog, formatUnits, getAddress, type Address, type Hex } from "viem";
+import { decodeEventLog, formatUnits, getAddress, type Address, type Hex, type Log } from "viem";
 import type { Server as SocketServer } from "socket.io";
 import {
   feesHarvestedEvent,
@@ -10,6 +10,8 @@ import {
 } from "./abi.js";
 import {
   LEGACY_TARGET_MARKET_CAP_USD,
+  logClient,
+  PAID_RPC_URLS,
   publicClient,
   RAMEN,
   requiredAddress,
@@ -32,6 +34,10 @@ interface PoolRow {
 interface FeePoolRow extends PoolRow {
   position_token_id: string;
   price_usd: string;
+}
+
+function paceRpc() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 1_200));
 }
 
 export class RamenpadIndexer {
@@ -122,14 +128,24 @@ export class RamenpadIndexer {
       const state = await this.db.query<{ block_number: string }>("SELECT block_number FROM ramenpad.indexer_state WHERE worker='main'");
       const configuredStart = BigInt(process.env.RAMENPAD_DEPLOYMENT_BLOCK || safeHead.toString());
       let from = state.rowCount ? BigInt(state.rows[0].block_number) + 1n : configuredStart;
-      while (from <= safeHead && !this.stopped) {
-        const to = from + 999n < safeHead ? from + 999n : safeHead;
+      const configuredRange = Number(process.env.RAMENPAD_INDEXER_BLOCK_RANGE);
+      const blockRange = BigInt(Number.isFinite(configuredRange) && configuredRange > 0
+        ? Math.floor(configuredRange)
+        : PAID_RPC_URLS.length ? 1_000 : 100);
+      const configuredRangesPerTick = Number(process.env.RAMENPAD_INDEXER_RANGES_PER_TICK);
+      const rangesPerTick = Number.isFinite(configuredRangesPerTick) && configuredRangesPerTick > 0
+        ? Math.floor(configuredRangesPerTick)
+        : PAID_RPC_URLS.length ? 20 : 1;
+      let rangesProcessed = 0;
+      while (from <= safeHead && !this.stopped && rangesProcessed < rangesPerTick) {
+        const to = from + blockRange - 1n < safeHead ? from + blockRange - 1n : safeHead;
         await this.indexRange(from, to);
         await this.db.query(`
           INSERT INTO ramenpad.indexer_state(worker, block_number) VALUES('main',$1)
           ON CONFLICT(worker) DO UPDATE SET block_number=EXCLUDED.block_number, updated_at=now()
         `, [to.toString()]);
         from = to + 1n;
+        rangesProcessed += 1;
       }
       this.consecutiveFailures = 0;
     } catch (error) {
@@ -140,7 +156,17 @@ export class RamenpadIndexer {
 
   private async indexRange(fromBlock: bigint, toBlock: bigint) {
     const systemAddresses = [this.launcher, this.locker, this.otc].filter(Boolean) as Address[];
-    const systemLogs = await publicClient.getLogs({ address: systemAddresses, fromBlock, toBlock });
+    const systemLogs: Log[] = [];
+    if (PAID_RPC_URLS.length) {
+      systemLogs.push(...await logClient.getLogs({ address: systemAddresses, fromBlock, toBlock }));
+    } else {
+      for (const address of systemAddresses) {
+        systemLogs.push(...await logClient.getLogs({ address, fromBlock, toBlock }));
+        await paceRpc();
+      }
+      systemLogs.sort((left, right) => Number((left.blockNumber || 0n) - (right.blockNumber || 0n))
+        || Number((left.logIndex || 0) - (right.logIndex || 0)));
+    }
     for (const log of systemLogs) {
       try {
         const address = log.address.toLowerCase();
@@ -166,7 +192,15 @@ export class RamenpadIndexer {
     const addresses = [...this.pools.values()].map((pool) => pool.pool_address);
     for (let index = 0; index < addresses.length; index += 100) {
       const batch = addresses.slice(index, index + 100);
-      const logs = await publicClient.getLogs({ address: batch, event: swapEvent, fromBlock, toBlock, strict: true });
+      const logs: Log[] = [];
+      if (PAID_RPC_URLS.length) {
+        logs.push(...await logClient.getLogs({ address: batch, event: swapEvent, fromBlock, toBlock, strict: true }));
+      } else {
+        for (const address of batch) {
+          logs.push(...await logClient.getLogs({ address, event: swapEvent, fromBlock, toBlock, strict: true }));
+          await paceRpc();
+        }
+      }
       for (const log of logs) await this.indexSwap(log as never);
     }
   }

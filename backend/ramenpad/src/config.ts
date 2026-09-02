@@ -46,10 +46,24 @@ const transport = fallback([
   ...FREE_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-free-${index}`, name: `RamenPad Free RPC ${index + 1}` })),
   ...PAID_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-paid-${index}`, name: `RamenPad Paid RPC ${index + 1}` })),
 ], { rank: false, retryCount: 0 });
+const logFreeRpcUrls = unique([
+  ...urls(process.env.ROBINHOOD_LOG_RPC_URLS),
+  process.env.ROBINHOOD_RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
+  "https://rpc.mainnet.chain.robinhood.com",
+]);
+const logTransport = fallback([
+  ...logFreeRpcUrls.map((url, index) => http(url, { key: `ramenpad-log-free-${index}`, name: `RamenPad Log RPC ${index + 1}` })),
+  ...PAID_RPC_URLS.map((url, index) => http(url, { key: `ramenpad-log-paid-${index}`, name: `RamenPad Paid Log RPC ${index + 1}` })),
+], { rank: false, retryCount: 0 });
 
 export const publicClient = createPublicClient({ chain: robinhood, transport });
+export const logClient = createPublicClient({ chain: robinhood, transport: logTransport });
 publicClient.transport.onResponse(({ status, transport: usedTransport }) => {
-  const tier = usedTransport.config.key.startsWith("ramenpad-paid-") ? "paid" : "free";
+  const tier = usedTransport.config.key.includes("-paid-") ? "paid" : "free";
+  rpcStats[tier][status === "success" ? "success" : "failure"] += 1;
+});
+logClient.transport.onResponse(({ status, transport: usedTransport }) => {
+  const tier = usedTransport.config.key.includes("-paid-") ? "paid" : "free";
   rpcStats[tier][status === "success" ? "success" : "failure"] += 1;
 });
 
