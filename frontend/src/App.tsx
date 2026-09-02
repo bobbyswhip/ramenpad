@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { decodeEventLog, encodeFunctionData, formatUnits, parseEther, parseUnits } from "viem";
-import { getConfig, getKpis, getQuote, getTokens, getTrades, subscribeLive, tokenImageUpdateMessage, updateTokenImage, uploadImage } from "./api";
+import { getConfig, getKpis, getQuote, getTokens, getTrades, requireLaunchReady, subscribeLive, tokenImageUpdateMessage, updateTokenImage, uploadImage } from "./api";
 import { erc20Abi, ethRouterAbi, launcherAbi, lockerAbi, otcAbi, quoterAbi, v2RouterAbi } from "./abi";
 import { ETH_ROUTER, LAUNCHER, OTC, RAMEN, RAMEN_IMAGE, RAMEN_PAIR, TARGET_MARKET_CAP, TARGET_TOKEN_PRICE, TOTAL_SUPPLY, V2_ROUTER, V3_QUOTER, WETH, robinhood } from "./config";
 import type { MarketUpdate, ProtocolKpis, RamenpadConfig, TokenSummary, TokenUpdate, Trade } from "./types";
@@ -152,6 +152,8 @@ function LaunchForm({ account, connect, onLaunched, payAsset, onPayAssetChange, 
         const expectedTokens = estimatedRamen * quote.ramenUsd / quote.targetTokenUsd;
         const minTokenOut = parseUnits((expectedTokens * (1 - slippage / 100)).toFixed(18), 18);
         if (payAsset === "ETH") {
+          setStatus("Checking launch services…");
+          await requireLaunchReady();
           setStatus("Confirm launch + ETH first buy in one transaction…");
           hash = await wallet.client.writeContract({
             address: launcherAddress, abi: launcherAbi, functionName: "launchAndBuy",
@@ -160,6 +162,8 @@ function LaunchForm({ account, connect, onLaunched, payAsset, onPayAssetChange, 
           });
         } else {
           await ensureAllowance(wallet, RAMEN, launcherAddress, firstBuyIn, setStatus);
+          setStatus("Checking launch services…");
+          await requireLaunchReady();
           setStatus("Confirm launch + first buy in one transaction…");
           hash = await wallet.client.writeContract({
             address: launcherAddress, abi: launcherAbi, functionName: "launchAndBuyWithRamen",
@@ -167,6 +171,9 @@ function LaunchForm({ account, connect, onLaunched, payAsset, onPayAssetChange, 
           });
         }
       } else {
+        setStatus("Checking launch services…");
+        await requireLaunchReady();
+        setStatus("Confirm the launch in your wallet…");
         hash = await wallet.client.writeContract({
           address: launcherAddress,
           abi: launcherAbi,

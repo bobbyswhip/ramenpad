@@ -31,11 +31,13 @@ Backend reads use ordered failover without latency ranking, so a paid request ca
 2. `ROBINHOOD_RPC_URL` (legacy single free endpoint)
 3. `ROBINHOOD_PAID_RPC_URLS` (comma-separated, optional and last)
 
-Confirmed historical `eth_getLogs` scans use `ROBINHOOD_LOG_RPC_URLS` (the Robinhood public RPC by default) and then `ROBINHOOD_PAID_RPC_URLS`. This capability-specific route avoids sending archive queries to tokenless PublicNode, which rejects them, while keeping PublicNode first for inexpensive current-state reads.
+Confirmed historical catch-up uses the capability-specific `ROBINHOOD_LOG_RPC_URLS` path because tokenless PublicNode rejects archive `eth_getLogs` requests. Each query combines the launcher, locker, and swapper addresses, while pool swaps are grouped in batches of up to 100 addresses. Failed log queries use bounded exponential retries and never advance the cursor.
 
-When no paid archive provider is configured, the indexer queries one watched contract per paced request because the public endpoint rate-limits multi-address historical scans. Once a paid provider is configured, it automatically switches to batches of up to 100 pools, retaining free-first failover without creating per-pool paid calls.
+Free-only catch-up processes one 1,000-block range per tick; this is safely faster than chain growth without producing a burst of per-address requests. Paid-backed indexing defaults to twenty 1,000-block ranges per tick. `RAMENPAD_INDEXER_BLOCK_RANGE` and `RAMENPAD_INDEXER_RANGES_PER_TICK` can override either mode.
 
-Free-only catch-up uses one 100-block range per tick and spaces watched-address log requests by three seconds to stay below the public endpoint's historical-query and burst-rate ceilings. Paid-backed indexing defaults to twenty 1,000-block ranges per tick. `RAMENPAD_INDEXER_BLOCK_RANGE` and `RAMENPAD_INDEXER_RANGES_PER_TICK` can override those values.
+The cursor is committed only after every watched contract in a range has been processed successfully. Launch, trade, and fee rows use conflict-safe event identities, so service restarts resume from the next uncommitted block without gaps or duplicates.
+
+`GET /health/ramenpad` reports `launchReady=false` until startup catch-up reaches the confirmed head, and after any indexing failure. The launch form checks this non-cacheable endpoint immediately before asking the wallet to submit. That pauses UI-originated launches during backend deploys while the durable cursor remains the recovery guarantee for direct contract calls and transactions already in flight.
 
 The health endpoint exposes aggregate success/failure counters by free or paid tier, never URLs or keys. A paid Robinhood Alchemy URL must be supplied explicitly; unrelated-chain Alchemy credentials must not be reused.
 

@@ -26,13 +26,28 @@ app.use("/ramenpad/uploads", express.static(path.resolve(process.cwd(), "uploads
 
 const db = createDatabase();
 await migrate(db);
+let indexer: RamenpadIndexer | undefined;
 app.use("/api/ramenpad", createRamenpadRouter(db));
-app.get("/health/ramenpad", (_request, response) => response.json({
-  ok: true,
-  service: "ramenpad",
-  chainId: 4663,
-  rpc: getRpcStats(),
-}));
+app.get("/health/ramenpad", (_request, response) => {
+  const indexerStatus = indexer?.getStatus() || {
+    ready: false,
+    caughtUp: false,
+    running: false,
+    lastSuccessfulTickAt: null,
+    lastIndexedBlock: null,
+    safeHead: null,
+    consecutiveFailures: 0,
+  };
+  response.setHeader("Cache-Control", "no-store");
+  response.json({
+    ok: true,
+    launchReady: indexerStatus.ready,
+    service: "ramenpad",
+    chainId: 4663,
+    indexer: indexerStatus,
+    rpc: getRpcStats(),
+  });
+});
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("[ramenpad:http]", error);
   const message = error instanceof Error ? error.message : "Internal server error";
@@ -42,7 +57,7 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 const port = Number(process.env.PORT || 4311);
 server.listen(port, () => console.log(`[ramenpad] listening on :${port}`));
 
-const indexer = process.env.RAMENPAD_LAUNCHER_ADDRESS ? new RamenpadIndexer(db, io) : undefined;
+indexer = process.env.RAMENPAD_LAUNCHER_ADDRESS ? new RamenpadIndexer(db, io) : undefined;
 if (indexer) await indexer.start();
 else console.warn("[ramenpad] RAMENPAD_LAUNCHER_ADDRESS is unset; indexer disabled");
 const keeper = process.env.RAMENPAD_LAUNCHER_ADDRESS && process.env.RAMENPAD_KEEPER_PRIVATE_KEY

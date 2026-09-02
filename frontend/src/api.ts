@@ -25,6 +25,18 @@ export function getConfig() {
   return json<RamenpadConfig>(`${API_URL}/config`);
 }
 
+export async function requireLaunchReady() {
+  const healthUrl = `${API_URL.replace(/\/api\/ramenpad$/, "")}/health/ramenpad`;
+  const response = await fetch(healthUrl, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(8_000),
+  });
+  const health = await response.json().catch(() => ({})) as { launchReady?: boolean };
+  if (!response.ok || !health.launchReady) {
+    throw new Error("Launches are briefly paused while the backend catches up. Please try again in a moment.");
+  }
+}
+
 export function getQuote(input: { creator: string; name: string; symbol: string }) {
   return json<LaunchQuote>(`${API_URL}/quote`, {
     method: "POST",

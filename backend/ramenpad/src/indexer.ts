@@ -36,8 +36,21 @@ interface FeePoolRow extends PoolRow {
   price_usd: string;
 }
 
-function paceRpc() {
-  return new Promise<void>((resolve) => setTimeout(resolve, 3_000));
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function withLogRetry<T>(request: () => Promise<T>) {
+  let lastError: unknown;
+  for (const waitMs of [0, 2_000, 5_000, 10_000]) {
+    if (waitMs) await delay(waitMs);
+    try {
+      return await request();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 export class RamenpadIndexer {
@@ -53,6 +66,10 @@ export class RamenpadIndexer {
   private repricing = false;
   private lastRamenUsd = 0;
   private consecutiveFailures = 0;
+  private caughtUp = false;
+  private lastSuccessfulTickAt?: Date;
+  private lastIndexedBlock?: bigint;
+  private safeHead?: bigint;
   private readonly intervalMs = Math.max(5_000, Number(process.env.RAMENPAD_INDEXER_INTERVAL_MS) || 15_000);
   private readonly maxBackoffMs = Math.max(this.intervalMs, Number(process.env.RAMENPAD_INDEXER_MAX_BACKOFF_MS) || 120_000);
 
@@ -64,6 +81,7 @@ export class RamenpadIndexer {
       publicClient.readContract({ address: this.launcher, abi: launcherAbi, functionName: "locker" }),
     ]);
     await this.loadPools();
+    await this.repairLaunchTimestamps();
     await this.runTick();
     await this.repriceMarkets();
     this.marketTimer = setInterval(() => void this.repriceMarkets(), 30_000);
@@ -75,6 +93,18 @@ export class RamenpadIndexer {
     if (this.timer) clearTimeout(this.timer);
     if (this.marketTimer) clearInterval(this.marketTimer);
     await this.currentTick;
+  }
+
+  getStatus() {
+    return {
+      ready: this.caughtUp && !this.stopped && this.consecutiveFailures === 0,
+      caughtUp: this.caughtUp,
+      running: this.running,
+      lastSuccessfulTickAt: this.lastSuccessfulTickAt?.toISOString() || null,
+      lastIndexedBlock: this.lastIndexedBlock?.toString() || null,
+      safeHead: this.safeHead?.toString() || null,
+      consecutiveFailures: this.consecutiveFailures,
+    };
   }
 
   private async repriceMarkets() {
@@ -119,19 +149,35 @@ export class RamenpadIndexer {
     for (const pool of result.rows) this.pools.set(pool.pool_address.toLowerCase(), pool);
   }
 
+  private async repairLaunchTimestamps() {
+    const result = await this.db.query<{ token_address: string; launch_block: string }>(`
+      SELECT token_address, launch_block::text
+      FROM ramenpad.launches
+      WHERE launched_at < '2020-01-01'::timestamptz
+    `);
+    for (const launch of result.rows) {
+      const block = await publicClient.getBlock({ blockNumber: BigInt(launch.launch_block) });
+      await this.db.query(
+        "UPDATE ramenpad.launches SET launched_at=$2 WHERE token_address=$1",
+        [launch.token_address, new Date(Number(block.timestamp) * 1000)],
+      );
+    }
+  }
+
   private async tick() {
     if (this.running || this.stopped) return;
     this.running = true;
     try {
       const chainHead = await publicClient.getBlockNumber();
       const safeHead = chainHead > 2n ? chainHead - 2n : chainHead;
+      this.safeHead = safeHead;
       const state = await this.db.query<{ block_number: string }>("SELECT block_number FROM ramenpad.indexer_state WHERE worker='main'");
       const configuredStart = BigInt(process.env.RAMENPAD_DEPLOYMENT_BLOCK || safeHead.toString());
       let from = state.rowCount ? BigInt(state.rows[0].block_number) + 1n : configuredStart;
       const configuredRange = Number(process.env.RAMENPAD_INDEXER_BLOCK_RANGE);
       const blockRange = BigInt(Number.isFinite(configuredRange) && configuredRange > 0
         ? Math.floor(configuredRange)
-        : PAID_RPC_URLS.length ? 1_000 : 100);
+        : 1_000);
       const configuredRangesPerTick = Number(process.env.RAMENPAD_INDEXER_RANGES_PER_TICK);
       const rangesPerTick = Number.isFinite(configuredRangesPerTick) && configuredRangesPerTick > 0
         ? Math.floor(configuredRangesPerTick)
@@ -144,11 +190,15 @@ export class RamenpadIndexer {
           INSERT INTO ramenpad.indexer_state(worker, block_number) VALUES('main',$1)
           ON CONFLICT(worker) DO UPDATE SET block_number=EXCLUDED.block_number, updated_at=now()
         `, [to.toString()]);
+        this.lastIndexedBlock = to;
         from = to + 1n;
         rangesProcessed += 1;
       }
+      this.caughtUp = from > safeHead;
+      this.lastSuccessfulTickAt = new Date();
       this.consecutiveFailures = 0;
     } catch (error) {
+      this.caughtUp = false;
       this.consecutiveFailures += 1;
       console.error("[ramenpad:indexer]", error);
     } finally { this.running = false; }
@@ -157,55 +207,53 @@ export class RamenpadIndexer {
   private async indexRange(fromBlock: bigint, toBlock: bigint) {
     const systemAddresses = [this.launcher, this.locker, this.otc].filter(Boolean) as Address[];
     const systemLogs: Log[] = [];
-    if (PAID_RPC_URLS.length) {
-      systemLogs.push(...await logClient.getLogs({ address: systemAddresses, fromBlock, toBlock }));
-    } else {
-      for (const address of systemAddresses) {
-        systemLogs.push(...await logClient.getLogs({ address, fromBlock, toBlock }));
-        await paceRpc();
-      }
-      systemLogs.sort((left, right) => Number((left.blockNumber || 0n) - (right.blockNumber || 0n))
-        || Number((left.logIndex || 0) - (right.logIndex || 0)));
-    }
+    systemLogs.push(...await withLogRetry(() => logClient.getLogs({ address: systemAddresses, fromBlock, toBlock })));
     for (const log of systemLogs) {
-      try {
-        const address = log.address.toLowerCase();
-        if (address === this.launcher.toLowerCase()) {
-          const decoded = decodeEventLog({ abi: launcherAbi, data: log.data, topics: log.topics });
-          if (decoded.eventName === "TokenLaunched") await this.indexLaunch({ ...log, ...decoded } as never);
-        } else if (this.locker && address === this.locker.toLowerCase()) {
-          const decoded = decodeEventLog({
+      const address = log.address.toLowerCase();
+      if (address === this.launcher.toLowerCase()) {
+        let decoded;
+        try { decoded = decodeEventLog({ abi: launcherAbi, data: log.data, topics: log.topics }); }
+        catch { continue; }
+        if (decoded.eventName === "TokenLaunched") await this.indexLaunch({ ...log, ...decoded } as never);
+      } else if (this.locker && address === this.locker.toLowerCase()) {
+        let decoded;
+        try {
+          decoded = decodeEventLog({
             abi: [feesHarvestedEvent, launcherFeesClaimedEvent, protocolFeesDepositedEvent],
             data: log.data,
             topics: log.topics,
           });
-          if (decoded.eventName === "FeesHarvested") await this.indexFeeHarvest({ ...log, ...decoded } as never);
-          else if (decoded.eventName === "LauncherFeesClaimed") await this.indexFeeClaim({ ...log, ...decoded } as never);
-          else if (decoded.eventName === "ProtocolFeesDeposited") await this.indexProtocolFeeDeposit({ ...log, ...decoded } as never);
-        } else if (this.otc && address === this.otc.toLowerCase()) {
-          const decoded = decodeEventLog({ abi: [otcSwapEvent], data: log.data, topics: log.topics });
-          if (decoded.eventName === "OtcSwap") await this.indexOtcSwap({ ...log, ...decoded } as never);
-        }
-      } catch { /* Ignore unrelated events emitted by the system contracts. */ }
+        } catch { continue; }
+        if (decoded.eventName === "FeesHarvested") await this.indexFeeHarvest({ ...log, ...decoded } as never);
+        else if (decoded.eventName === "LauncherFeesClaimed") await this.indexFeeClaim({ ...log, ...decoded } as never);
+        else if (decoded.eventName === "ProtocolFeesDeposited") await this.indexProtocolFeeDeposit({ ...log, ...decoded } as never);
+      } else if (this.otc && address === this.otc.toLowerCase()) {
+        let decoded;
+        try { decoded = decodeEventLog({ abi: [otcSwapEvent], data: log.data, topics: log.topics }); }
+        catch { continue; }
+        if (decoded.eventName === "OtcSwap") await this.indexOtcSwap({ ...log, ...decoded } as never);
+      }
     }
 
     const addresses = [...this.pools.values()].map((pool) => pool.pool_address);
     for (let index = 0; index < addresses.length; index += 100) {
       const batch = addresses.slice(index, index + 100);
       const logs: Log[] = [];
-      if (PAID_RPC_URLS.length) {
-        logs.push(...await logClient.getLogs({ address: batch, event: swapEvent, fromBlock, toBlock, strict: true }));
-      } else {
-        for (const address of batch) {
-          logs.push(...await logClient.getLogs({ address, event: swapEvent, fromBlock, toBlock, strict: true }));
-          await paceRpc();
-        }
-      }
+      logs.push(...await withLogRetry(() => logClient.getLogs({
+        address: batch, event: swapEvent, fromBlock, toBlock, strict: true,
+      })));
       for (const log of logs) await this.indexSwap(log as never);
     }
   }
 
-  private async indexLaunch(log: { args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint }) {
+  private async blockTime(log: { blockNumber: bigint }) {
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    return new Date(Number(block.timestamp) * 1000);
+  }
+
+  private async indexLaunch(log: {
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
+  }) {
     const args = log.args as {
       token: Address; launcher: Address; pool: Address; positionTokenId: bigint;
       name: string; symbol: string; imageUrl: string; sqrtPriceX96: bigint; tickLower: number; tickUpper: number;
@@ -214,8 +262,7 @@ export class RamenpadIndexer {
     const pool = getAddress(args.pool);
     const token0 = BigInt(token) < BigInt(RAMEN) ? token : RAMEN;
     const token1 = token0 === token ? RAMEN : token;
-    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    const launchedAt = new Date(Number(block.timestamp) * 1000);
+    const launchedAt = await this.blockTime(log);
     const targetMarketCapUsd = log.blockNumber >= TARGET_2000_ACTIVATION_BLOCK
       ? TARGET_MARKET_CAP_USD
       : LEGACY_TARGET_MARKET_CAP_USD;
@@ -248,7 +295,8 @@ export class RamenpadIndexer {
   }
 
   private async indexSwap(log: {
-    address: Address; args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+    address: Address; args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
+    logIndex: number;
   }) {
     const pool = this.pools.get(log.address.toLowerCase());
     if (!pool) return;
@@ -274,8 +322,7 @@ export class RamenpadIndexer {
       return;
     }
     const usdValue = Number(ramenAmount) * ramenUsd;
-    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const blockTime = await this.blockTime(log);
     const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
     const result = await this.db.query(`
       INSERT INTO ramenpad.trades(
@@ -303,7 +350,8 @@ export class RamenpadIndexer {
   }
 
   private async indexOtcSwap(log: {
-    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
+    logIndex: number;
   }) {
     const args = log.args as {
       token: Address; trader: Address; recipient: Address; isBuy: boolean; amountIn: bigint; amountOut: bigint;
@@ -323,8 +371,7 @@ export class RamenpadIndexer {
     const priceUsd = priceRamen * ramenUsd;
     const marketCapUsd = priceUsd * TOTAL_SUPPLY;
     const usdValue = Number(ramenAmount) * ramenUsd;
-    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const blockTime = await this.blockTime(log);
     const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
     const result = await this.db.query(`
       INSERT INTO ramenpad.trades(
@@ -367,7 +414,8 @@ export class RamenpadIndexer {
   }
 
   private async indexFeeHarvest(log: {
-    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
+    logIndex: number;
   }) {
     const args = log.args as {
       tokenId: bigint; creatorAmount0: bigint; creatorAmount1: bigint;
@@ -389,8 +437,7 @@ export class RamenpadIndexer {
     const launcherFeeUsd = Number(launcherToken) * tokenUsd + Number(launcherRamen) * ramenUsd;
     const protocolFeeUsd = (Number(devToken) + Number(ownerToken)) * tokenUsd
       + (Number(devRamen) + Number(ownerRamen)) * ramenUsd;
-    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const blockTime = await this.blockTime(log);
     const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
     const result = await this.db.query(`
       INSERT INTO ramenpad.fee_harvests(
@@ -413,7 +460,8 @@ export class RamenpadIndexer {
   }
 
   private async indexFeeClaim(log: {
-    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
+    logIndex: number;
   }) {
     const args = log.args as { tokenId: bigint; launcher: Address; amount0: bigint; amount1: bigint };
     const pool = await this.feePool(args.tokenId);
@@ -422,8 +470,7 @@ export class RamenpadIndexer {
     const tokenAmount = formatUnits(tokenRaw, 18);
     const ramenAmount = formatUnits(ramenRaw, 18);
     const claimedUsd = Number(tokenAmount) * Number(pool.price_usd) + Number(ramenAmount) * await getRamenUsd();
-    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const blockTime = await this.blockTime(log);
     const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
     await this.db.query(`
       INSERT INTO ramenpad.fee_claims(
@@ -438,7 +485,8 @@ export class RamenpadIndexer {
   }
 
   private async indexProtocolFeeDeposit(log: {
-    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint;
+    logIndex: number;
   }) {
     const args = log.args as { tokenId: bigint; asset: Address; devAmount: bigint; ownerAmount: bigint };
     const pool = await this.feePool(args.tokenId);
@@ -450,8 +498,7 @@ export class RamenpadIndexer {
     const zero = "0";
     const devAmount = formatUnits(args.devAmount, 18);
     const ownerAmount = formatUnits(args.ownerAmount, 18);
-    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
-    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const blockTime = await this.blockTime(log);
     const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
     await this.db.query(`
       INSERT INTO ramenpad.protocol_fee_deposits(
