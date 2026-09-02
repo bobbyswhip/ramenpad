@@ -408,7 +408,7 @@ function TokenCard({ token, account, claim, onNotice, locker, claimable, payAsse
           <span>{token.harvestCount || 0} harvests</span>
         </div>
         <div className="token-actions">
-          <a href={`https://dexscreener.com/robinhood/${token.poolAddress}`} target="_blank" rel="noreferrer">TRADE ↗</a>
+          <a href={`https://dexscreener.com/robinhood/${token.poolAddress}`} target="_blank" rel="noreferrer">DEXSCREENER ↗</a>
           <a href={`${robinhood.blockExplorers.default.url}/address/${token.tokenAddress}`} target="_blank" rel="noreferrer">CONTRACT ↗</a>
           {locker && <a className="locker-link" href={`${robinhood.blockExplorers.default.url}/address/${locker}`} target="_blank" rel="noreferrer">🔒 LP #{token.positionTokenId} LOCKED FOREVER ↗</a>}
         </div>
@@ -424,14 +424,14 @@ function TokenCard({ token, account, claim, onNotice, locker, claimable, payAsse
   );
 }
 
-function MiniToken({ token, badge, detail }: { token: TokenSummary; badge: string; detail: string }) {
-  return <a className="mini-token" href={`https://dexscreener.com/robinhood/${token.poolAddress}`} target="_blank" rel="noreferrer">
+function MiniToken({ token, badge, detail, onSelect }: { token: TokenSummary; badge: string; detail: string; onSelect: (token: TokenSummary) => void }) {
+  return <button type="button" className="mini-token" onClick={() => onSelect(token)}>
     <div className="mini-art">{token.imageUrl ? <img src={token.imageUrl} alt="" /> : "🍜"}</div>
-    <div><small>{badge}</small><strong>{token.name}</strong><span>${token.symbol} · {detail}</span></div><i>↗</i>
-  </a>;
+    <div><small>{badge}</small><strong>{token.name}</strong><span>${token.symbol} · {detail}</span></div><i>→</i>
+  </button>;
 }
 
-function HomeDiscovery({ tokens, trades }: { tokens: TokenSummary[]; trades: Trade[] }) {
+function HomeDiscovery({ tokens, trades, onSelect }: { tokens: TokenSummary[]; trades: Trade[]; onSelect: (token: TokenSummary) => void }) {
   const top = [...tokens].sort((a, b) => (b.volumeUsd || 0) - (a.volumeUsd || 0)).slice(0, 3);
   const recentBuyTokens: Array<{ token: TokenSummary; trade: Trade }> = [];
   const seen = new Set<string>();
@@ -445,10 +445,10 @@ function HomeDiscovery({ tokens, trades }: { tokens: TokenSummary[]; trades: Tra
   }
   return <section className="home-discovery">
     <div className="discovery-block"><div className="section-title"><div><span>LEADING THE MENU</span><h2>Top 3 tokens</h2></div><b>BY VOLUME</b></div>
-      <div className="top-grid">{top.length ? top.map((token, index) => <MiniToken key={token.tokenAddress} token={token} badge={`#${index + 1} TOP TOKEN`} detail={`${money.format(token.volumeUsd || 0)} volume`} />) : <p className="discovery-empty">The leaderboard starts after the first launch.</p>}</div>
+      <div className="top-grid">{top.length ? top.map((token, index) => <MiniToken key={token.tokenAddress} token={token} badge={`#${index + 1} TOP TOKEN`} detail={`${money.format(token.volumeUsd || 0)} volume`} onSelect={onSelect} />) : <p className="discovery-empty">The leaderboard starts after the first launch.</p>}</div>
     </div>
     <div className="discovery-block"><div className="section-title"><div><span>BUY ACTIVITY</span><h2>Hot new tokens</h2></div><b>10 MOST RECENT</b></div>
-      <div className="hot-list">{recentBuyTokens.length ? recentBuyTokens.map(({ token, trade }) => <MiniToken key={token.tokenAddress} token={token} badge="JUST BOUGHT" detail={`${money.format(trade.usdValue)} latest buy`} />) : <p className="discovery-empty">Recent buys will appear here live.</p>}</div>
+      <div className="hot-list">{recentBuyTokens.length ? recentBuyTokens.map(({ token, trade }) => <MiniToken key={token.tokenAddress} token={token} badge="JUST BOUGHT" detail={`${money.format(trade.usdValue)} latest buy`} onSelect={onSelect} />) : <p className="discovery-empty">Recent buys will appear here live.</p>}</div>
     </div>
   </section>;
 }
@@ -457,7 +457,7 @@ function DiscoveryToken({ token, label, onSelect }: { token: TokenSummary; label
   return <button type="button" className="discovery-token" onClick={() => onSelect(token)}>
     <div className="discovery-token-art">{token.imageUrl ? <img src={token.imageUrl} alt="" /> : <span>R</span>}</div>
     <div className="discovery-token-name">{label && <small>{label}</small>}<strong>{token.name}</strong><span>${token.symbol} · {shortAddress(token.tokenAddress)}</span></div>
-    <div className="discovery-token-stat"><small>PRICE</small><b>${(token.priceUsd || .001).toPrecision(4)}</b></div>
+    <div className="discovery-token-stat"><small>PRICE</small><b>${(token.priceUsd || TARGET_TOKEN_PRICE).toPrecision(4)}</b></div>
     <div className="discovery-token-stat"><small>MARKET CAP</small><b>{money.format(token.marketCapUsd || TARGET_MARKET_CAP)}</b></div>
     <div className="discovery-token-stat"><small>VOLUME</small><b>{money.format(token.volumeUsd || 0)}</b></div>
     <i>VIEW / BUY →</i>
@@ -856,7 +856,7 @@ export default function App() {
       </header>
       <LiveTape trades={buys} />
       <main>
-        {tab === "launch" ? <><LaunchForm account={account} connect={connect} onLaunched={(token) => { setTokens((list) => [token, ...list]); openToken(token); }} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} /><HomeDiscovery tokens={tokens} trades={trades} /></> : tab === "explore" ? (
+        {tab === "launch" ? <><LaunchForm account={account} connect={connect} onLaunched={(token) => { setTokens((list) => [token, ...list]); openToken(token); }} payAsset={payAsset} onPayAssetChange={choosePayAsset} ethBalance={ethBalance} ramenBalance={ramenBalance} /><HomeDiscovery tokens={tokens} trades={trades} onSelect={openToken} /></> : tab === "explore" ? (
           selectedToken ? <section className="explore token-detail-page">
             <button type="button" className="back-to-explore" onClick={() => setSelectedTokenAddress(undefined)}>← BACK TO LIVE EXPLORE</button>
             <div className="token-detail-heading"><div><span className="eyebrow">TOKEN MARKET</span><h2>{selectedToken.name}</h2><p>Live market data, quotes and permanently locked liquidity.</p></div><b>${selectedToken.symbol}</b></div>
