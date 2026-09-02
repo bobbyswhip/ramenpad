@@ -1,0 +1,391 @@
+import { decodeEventLog, formatUnits, getAddress, type Address, type Hex } from "viem";
+import type { Server as SocketServer } from "socket.io";
+import {
+  feesHarvestedEvent,
+  launcherAbi,
+  launcherFeesClaimedEvent,
+  otcSwapEvent,
+  protocolFeesDepositedEvent,
+  swapEvent,
+} from "./abi.js";
+import {
+  LEGACY_TARGET_MARKET_CAP_USD,
+  publicClient,
+  RAMEN,
+  requiredAddress,
+  TARGET_2000_ACTIVATION_BLOCK,
+  TARGET_MARKET_CAP_USD,
+  TOTAL_SUPPLY,
+} from "./config.js";
+import type { Database } from "./db.js";
+import { priceFromSqrt } from "./math.js";
+import { getRamenUsd } from "./ramenPrice.js";
+
+interface PoolRow {
+  token_address: Address;
+  pool_address: Address;
+  token0: Address;
+  token1: Address;
+  symbol: string;
+}
+
+interface FeePoolRow extends PoolRow {
+  position_token_id: string;
+  price_usd: string;
+}
+
+export class RamenpadIndexer {
+  private stopped = false;
+  private running = false;
+  private pools = new Map<string, PoolRow>();
+  private launcher = requiredAddress("RAMENPAD_LAUNCHER_ADDRESS");
+  private otc?: Address;
+  private locker?: Address;
+  private timer?: NodeJS.Timeout;
+  private currentTick?: Promise<void>;
+  private consecutiveFailures = 0;
+  private readonly intervalMs = Math.max(5_000, Number(process.env.RAMENPAD_INDEXER_INTERVAL_MS) || 15_000);
+  private readonly maxBackoffMs = Math.max(this.intervalMs, Number(process.env.RAMENPAD_INDEXER_MAX_BACKOFF_MS) || 120_000);
+
+  constructor(private db: Database, private io: SocketServer) {}
+
+  async start() {
+    [this.otc, this.locker] = await Promise.all([
+      publicClient.readContract({ address: this.launcher, abi: launcherAbi, functionName: "otc" }),
+      publicClient.readContract({ address: this.launcher, abi: launcherAbi, functionName: "locker" }),
+    ]);
+    await this.loadPools();
+    await this.runTick();
+    this.schedule();
+  }
+
+  async stop() {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    await this.currentTick;
+  }
+
+  private runTick() {
+    if (!this.currentTick) {
+      this.currentTick = this.tick().finally(() => { this.currentTick = undefined; });
+    }
+    return this.currentTick;
+  }
+
+  private schedule() {
+    if (this.stopped) return;
+    const delay = Math.min(this.intervalMs * (2 ** this.consecutiveFailures), this.maxBackoffMs);
+    this.timer = setTimeout(async () => {
+      await this.runTick();
+      this.schedule();
+    }, delay);
+  }
+
+  private async loadPools() {
+    const result = await this.db.query<PoolRow>("SELECT token_address, pool_address, token0, token1, symbol FROM ramenpad.launches");
+    for (const pool of result.rows) this.pools.set(pool.pool_address.toLowerCase(), pool);
+  }
+
+  private async tick() {
+    if (this.running || this.stopped) return;
+    this.running = true;
+    try {
+      const chainHead = await publicClient.getBlockNumber();
+      const safeHead = chainHead > 2n ? chainHead - 2n : chainHead;
+      const state = await this.db.query<{ block_number: string }>("SELECT block_number FROM ramenpad.indexer_state WHERE worker='main'");
+      const configuredStart = BigInt(process.env.RAMENPAD_DEPLOYMENT_BLOCK || safeHead.toString());
+      let from = state.rowCount ? BigInt(state.rows[0].block_number) + 1n : configuredStart;
+      while (from <= safeHead && !this.stopped) {
+        const to = from + 999n < safeHead ? from + 999n : safeHead;
+        await this.indexRange(from, to);
+        await this.db.query(`
+          INSERT INTO ramenpad.indexer_state(worker, block_number) VALUES('main',$1)
+          ON CONFLICT(worker) DO UPDATE SET block_number=EXCLUDED.block_number, updated_at=now()
+        `, [to.toString()]);
+        from = to + 1n;
+      }
+      this.consecutiveFailures = 0;
+    } catch (error) {
+      this.consecutiveFailures += 1;
+      console.error("[ramenpad:indexer]", error);
+    } finally { this.running = false; }
+  }
+
+  private async indexRange(fromBlock: bigint, toBlock: bigint) {
+    const systemAddresses = [this.launcher, this.locker, this.otc].filter(Boolean) as Address[];
+    const systemLogs = await publicClient.getLogs({ address: systemAddresses, fromBlock, toBlock });
+    for (const log of systemLogs) {
+      try {
+        const address = log.address.toLowerCase();
+        if (address === this.launcher.toLowerCase()) {
+          const decoded = decodeEventLog({ abi: launcherAbi, data: log.data, topics: log.topics });
+          if (decoded.eventName === "TokenLaunched") await this.indexLaunch({ ...log, ...decoded } as never);
+        } else if (this.locker && address === this.locker.toLowerCase()) {
+          const decoded = decodeEventLog({
+            abi: [feesHarvestedEvent, launcherFeesClaimedEvent, protocolFeesDepositedEvent],
+            data: log.data,
+            topics: log.topics,
+          });
+          if (decoded.eventName === "FeesHarvested") await this.indexFeeHarvest({ ...log, ...decoded } as never);
+          else if (decoded.eventName === "LauncherFeesClaimed") await this.indexFeeClaim({ ...log, ...decoded } as never);
+          else if (decoded.eventName === "ProtocolFeesDeposited") await this.indexProtocolFeeDeposit({ ...log, ...decoded } as never);
+        } else if (this.otc && address === this.otc.toLowerCase()) {
+          const decoded = decodeEventLog({ abi: [otcSwapEvent], data: log.data, topics: log.topics });
+          if (decoded.eventName === "OtcSwap") await this.indexOtcSwap({ ...log, ...decoded } as never);
+        }
+      } catch { /* Ignore unrelated events emitted by the system contracts. */ }
+    }
+
+    const addresses = [...this.pools.values()].map((pool) => pool.pool_address);
+    for (let index = 0; index < addresses.length; index += 100) {
+      const batch = addresses.slice(index, index + 100);
+      const logs = await publicClient.getLogs({ address: batch, event: swapEvent, fromBlock, toBlock, strict: true });
+      for (const log of logs) await this.indexSwap(log as never);
+    }
+  }
+
+  private async indexLaunch(log: { args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint }) {
+    const args = log.args as {
+      token: Address; launcher: Address; pool: Address; positionTokenId: bigint;
+      name: string; symbol: string; imageUrl: string; sqrtPriceX96: bigint; tickLower: number; tickUpper: number;
+    };
+    const token = getAddress(args.token);
+    const pool = getAddress(args.pool);
+    const token0 = BigInt(token) < BigInt(RAMEN) ? token : RAMEN;
+    const token1 = token0 === token ? RAMEN : token;
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    const launchedAt = new Date(Number(block.timestamp) * 1000);
+    const launchMarketCapUsd = log.blockNumber >= TARGET_2000_ACTIVATION_BLOCK
+      ? TARGET_MARKET_CAP_USD
+      : LEGACY_TARGET_MARKET_CAP_USD;
+    const launchPriceUsd = launchMarketCapUsd / TOTAL_SUPPLY;
+    const result = await this.db.query(`
+      INSERT INTO ramenpad.launches(
+        token_address,pool_address,launcher,position_token_id,name,symbol,image_url,token0,token1,
+        sqrt_price_x96,tick_lower,tick_upper,launch_tx,launch_block,launched_at,price_usd,market_cap_usd
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+      ON CONFLICT(token_address) DO NOTHING RETURNING *
+    `, [
+      token.toLowerCase(), pool.toLowerCase(), args.launcher.toLowerCase(), args.positionTokenId.toString(),
+      args.name, args.symbol, args.imageUrl, token0.toLowerCase(), token1.toLowerCase(), args.sqrtPriceX96.toString(),
+      args.tickLower, args.tickUpper, log.transactionHash.toLowerCase(), log.blockNumber.toString(), launchedAt,
+      launchPriceUsd, launchMarketCapUsd,
+    ]);
+    const row: PoolRow = { token_address: token, pool_address: pool, token0, token1, symbol: args.symbol };
+    this.pools.set(pool.toLowerCase(), row);
+    if (result.rowCount) this.io.emit("ramenpad:launch", {
+      tokenAddress: token, poolAddress: pool, launcher: args.launcher,
+      positionTokenId: args.positionTokenId.toString(), name: args.name, symbol: args.symbol,
+      imageUrl: args.imageUrl, launchedAt: launchedAt.toISOString(), priceUsd: launchPriceUsd,
+      marketCapUsd: launchMarketCapUsd, volumeUsd: 0,
+    });
+  }
+
+  private async indexSwap(log: {
+    address: Address; args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+  }) {
+    const pool = this.pools.get(log.address.toLowerCase());
+    if (!pool) return;
+    const args = log.args as { recipient: Address; amount0: bigint; amount1: bigint; sqrtPriceX96: bigint };
+    if (this.otc && args.recipient.toLowerCase() === this.otc.toLowerCase()) return;
+    const tokenIsToken0 = pool.token0.toLowerCase() === pool.token_address.toLowerCase();
+    const tokenDelta = tokenIsToken0 ? args.amount0 : args.amount1;
+    const ramenDelta = tokenIsToken0 ? args.amount1 : args.amount0;
+    const side = tokenDelta < 0n ? "buy" : "sell";
+    const tokenAmount = formatUnits(tokenDelta < 0n ? -tokenDelta : tokenDelta, 18);
+    const ramenAmount = formatUnits(ramenDelta < 0n ? -ramenDelta : ramenDelta, 18);
+    const ramenUsd = await getRamenUsd();
+    const { priceUsd } = priceFromSqrt(args.sqrtPriceX96, tokenIsToken0, ramenUsd);
+    const marketCapUsd = priceUsd * TOTAL_SUPPLY;
+    const usdValue = Number(ramenAmount) * ramenUsd;
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
+    const result = await this.db.query(`
+      INSERT INTO ramenpad.trades(
+        id,token_address,pool_address,side,trader,token_amount,ramen_amount,usd_value,price_usd,
+        market_cap_usd,sqrt_price_x96,tx_hash,log_index,block_number,block_time
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT(id) DO NOTHING RETURNING id
+    `, [
+      id, pool.token_address.toLowerCase(), pool.pool_address.toLowerCase(), side, args.recipient.toLowerCase(),
+      tokenAmount, ramenAmount, usdValue, priceUsd, marketCapUsd, args.sqrtPriceX96.toString(),
+      log.transactionHash.toLowerCase(), log.logIndex, log.blockNumber.toString(), blockTime,
+    ]);
+    if (!result.rowCount) return;
+    await this.db.query(`
+      UPDATE ramenpad.launches SET price_usd=$2, market_cap_usd=$3, volume_usd=volume_usd+$4
+      WHERE token_address=$1
+    `, [pool.token_address.toLowerCase(), priceUsd, marketCapUsd, usdValue]);
+    this.io.emit("ramenpad:trade", {
+      id, tokenAddress: pool.token_address, poolAddress: pool.pool_address, symbol: pool.symbol,
+      side, trader: args.recipient, tokenAmount, ramenAmount, usdValue, priceUsd, marketCapUsd,
+      txHash: log.transactionHash, blockTime: blockTime.toISOString(),
+    });
+    this.io.emit("ramenpad:tokens:update", { tokenAddress: pool.token_address, priceUsd, marketCapUsd, volumeDeltaUsd: usdValue });
+  }
+
+  private async indexOtcSwap(log: {
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+  }) {
+    const args = log.args as {
+      token: Address; trader: Address; recipient: Address; isBuy: boolean; amountIn: bigint; amountOut: bigint;
+    };
+    const launchResult = await this.db.query<PoolRow>(
+      "SELECT token_address, pool_address, token0, token1, symbol FROM ramenpad.launches WHERE token_address=$1",
+      [args.token.toLowerCase()],
+    );
+    const pool = launchResult.rows[0];
+    if (!pool) return;
+    const tokenRaw = args.isBuy ? args.amountOut : args.amountIn;
+    const ramenRaw = args.isBuy ? args.amountIn : args.amountOut;
+    const tokenAmount = formatUnits(tokenRaw, 18);
+    const ramenAmount = formatUnits(ramenRaw, 18);
+    const ramenUsd = await getRamenUsd();
+    const priceUsd = Number(tokenAmount) === 0 ? 0 : Number(ramenAmount) * ramenUsd / Number(tokenAmount);
+    const marketCapUsd = priceUsd * TOTAL_SUPPLY;
+    const usdValue = Number(ramenAmount) * ramenUsd;
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
+    const result = await this.db.query(`
+      INSERT INTO ramenpad.trades(
+        id,token_address,pool_address,side,trader,token_amount,ramen_amount,usd_value,price_usd,
+        market_cap_usd,sqrt_price_x96,tx_hash,log_index,block_number,block_time
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,$12,$13,$14)
+      ON CONFLICT(id) DO NOTHING RETURNING id
+    `, [
+      id, pool.token_address.toLowerCase(), pool.pool_address.toLowerCase(), args.isBuy ? "buy" : "sell",
+      args.recipient.toLowerCase(), tokenAmount, ramenAmount, usdValue, priceUsd, marketCapUsd,
+      log.transactionHash.toLowerCase(), log.logIndex, log.blockNumber.toString(), blockTime,
+    ]);
+    if (!result.rowCount) return;
+    await this.db.query(`
+      UPDATE ramenpad.launches SET price_usd=$2, market_cap_usd=$3, volume_usd=volume_usd+$4
+      WHERE token_address=$1
+    `, [pool.token_address.toLowerCase(), priceUsd, marketCapUsd, usdValue]);
+    const trade = {
+      id, tokenAddress: pool.token_address, poolAddress: pool.pool_address, symbol: pool.symbol,
+      side: args.isBuy ? "buy" : "sell", trader: args.recipient, tokenAmount, ramenAmount,
+      usdValue, priceUsd, marketCapUsd, txHash: log.transactionHash, blockTime: blockTime.toISOString(),
+    };
+    this.io.emit("ramenpad:trade", trade);
+    this.io.emit("ramenpad:tokens:update", {
+      tokenAddress: pool.token_address, priceUsd, marketCapUsd, volumeDeltaUsd: usdValue,
+    });
+  }
+
+  private async feePool(tokenId: bigint) {
+    const result = await this.db.query<FeePoolRow>(`
+      SELECT token_address, pool_address, token0, token1, symbol, position_token_id::text, price_usd::text
+      FROM ramenpad.launches WHERE position_token_id=$1
+    `, [tokenId.toString()]);
+    return result.rows[0];
+  }
+
+  private splitAssets(pool: FeePoolRow, amount0: bigint, amount1: bigint) {
+    const tokenIs0 = pool.token0.toLowerCase() === pool.token_address.toLowerCase();
+    return tokenIs0 ? [amount0, amount1] as const : [amount1, amount0] as const;
+  }
+
+  private async indexFeeHarvest(log: {
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+  }) {
+    const args = log.args as {
+      tokenId: bigint; creatorAmount0: bigint; creatorAmount1: bigint;
+      devAmount0: bigint; devAmount1: bigint; ownerAmount0: bigint; ownerAmount1: bigint;
+    };
+    const pool = await this.feePool(args.tokenId);
+    if (!pool) return;
+    const [launcherTokenRaw, launcherRamenRaw] = this.splitAssets(pool, args.creatorAmount0, args.creatorAmount1);
+    const [devTokenRaw, devRamenRaw] = this.splitAssets(pool, args.devAmount0, args.devAmount1);
+    const [ownerTokenRaw, ownerRamenRaw] = this.splitAssets(pool, args.ownerAmount0, args.ownerAmount1);
+    const launcherToken = formatUnits(launcherTokenRaw, 18);
+    const launcherRamen = formatUnits(launcherRamenRaw, 18);
+    const devToken = formatUnits(devTokenRaw, 18);
+    const devRamen = formatUnits(devRamenRaw, 18);
+    const ownerToken = formatUnits(ownerTokenRaw, 18);
+    const ownerRamen = formatUnits(ownerRamenRaw, 18);
+    const ramenUsd = await getRamenUsd();
+    const tokenUsd = Number(pool.price_usd);
+    const launcherFeeUsd = Number(launcherToken) * tokenUsd + Number(launcherRamen) * ramenUsd;
+    const protocolFeeUsd = (Number(devToken) + Number(ownerToken)) * tokenUsd
+      + (Number(devRamen) + Number(ownerRamen)) * ramenUsd;
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
+    const result = await this.db.query(`
+      INSERT INTO ramenpad.fee_harvests(
+        id,token_address,position_token_id,launcher_token_amount,launcher_ramen_amount,
+        dev_token_amount,dev_ramen_amount,owner_token_amount,owner_ramen_amount,
+        total_fee_usd,launcher_fee_usd,protocol_fee_usd,tx_hash,log_index,block_number,block_time
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      ON CONFLICT(id) DO NOTHING RETURNING id
+    `, [
+      id, pool.token_address.toLowerCase(), args.tokenId.toString(), launcherToken, launcherRamen,
+      devToken, devRamen, ownerToken, ownerRamen, launcherFeeUsd + protocolFeeUsd, launcherFeeUsd,
+      protocolFeeUsd, log.transactionHash.toLowerCase(), log.logIndex, log.blockNumber.toString(), blockTime,
+    ]);
+    if (result.rowCount) this.io.emit("ramenpad:fees", {
+      tokenAddress: pool.token_address,
+      totalFeeUsd: launcherFeeUsd + protocolFeeUsd,
+      launcherFeeUsd,
+      protocolFeeUsd,
+    });
+  }
+
+  private async indexFeeClaim(log: {
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+  }) {
+    const args = log.args as { tokenId: bigint; launcher: Address; amount0: bigint; amount1: bigint };
+    const pool = await this.feePool(args.tokenId);
+    if (!pool) return;
+    const [tokenRaw, ramenRaw] = this.splitAssets(pool, args.amount0, args.amount1);
+    const tokenAmount = formatUnits(tokenRaw, 18);
+    const ramenAmount = formatUnits(ramenRaw, 18);
+    const claimedUsd = Number(tokenAmount) * Number(pool.price_usd) + Number(ramenAmount) * await getRamenUsd();
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
+    await this.db.query(`
+      INSERT INTO ramenpad.fee_claims(
+        id,token_address,position_token_id,token_amount,ramen_amount,claimed_usd,
+        tx_hash,log_index,block_number,block_time
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT(id) DO NOTHING
+    `, [
+      id, pool.token_address.toLowerCase(), args.tokenId.toString(), tokenAmount, ramenAmount, claimedUsd,
+      log.transactionHash.toLowerCase(), log.logIndex, log.blockNumber.toString(), blockTime,
+    ]);
+  }
+
+  private async indexProtocolFeeDeposit(log: {
+    args: Record<string, unknown>; transactionHash: Hex; blockNumber: bigint; logIndex: number;
+  }) {
+    const args = log.args as { tokenId: bigint; asset: Address; devAmount: bigint; ownerAmount: bigint };
+    const pool = await this.feePool(args.tokenId);
+    if (!pool) return;
+    const asset = args.asset.toLowerCase();
+    const isToken = asset === pool.token_address.toLowerCase();
+    const isRamen = asset === RAMEN.toLowerCase();
+    if (!isToken && !isRamen) return;
+    const zero = "0";
+    const devAmount = formatUnits(args.devAmount, 18);
+    const ownerAmount = formatUnits(args.ownerAmount, 18);
+    const block = await publicClient.getBlock({ blockNumber: log.blockNumber });
+    const blockTime = new Date(Number(block.timestamp) * 1000);
+    const id = `${log.transactionHash.toLowerCase()}:${log.logIndex}`;
+    await this.db.query(`
+      INSERT INTO ramenpad.protocol_fee_deposits(
+        id,token_address,position_token_id,asset,dev_token_amount,dev_ramen_amount,
+        owner_token_amount,owner_ramen_amount,tx_hash,log_index,block_number,block_time
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT(id) DO NOTHING
+    `, [
+      id, pool.token_address.toLowerCase(), args.tokenId.toString(), asset,
+      isToken ? devAmount : zero, isRamen ? devAmount : zero,
+      isToken ? ownerAmount : zero, isRamen ? ownerAmount : zero,
+      log.transactionHash.toLowerCase(), log.logIndex, log.blockNumber.toString(), blockTime,
+    ]);
+  }
+}

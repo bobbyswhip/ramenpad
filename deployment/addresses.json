@@ -1,0 +1,24 @@
+{
+  "chainId": 4663,
+  "network": "Robinhood Chain",
+  "ownerDeployer": "0x18d7C1AD00D336C9BFC304fE828Da9fE29656c31",
+  "quoteSigner": "0x4FC9E72d298fE5E8cBE563dD4A42b4dBC0710800",
+  "keeper": "0xd62b96627773c9D8bC55827532d0445461814479",
+  "launcher": "0xC89f3837895b3e02c54F254eD73D580016Bbd3E7",
+  "liquidityLocker": "0x6232e26bEa0283d15dFde673ADA0cc993bC7B90F",
+  "otc": "0x76B480be19abe121907Aaa5028F52462C8F2F8b5",
+  "ethRouter": "0x04231d4EBa71Fd75C3e124E9b332BBB445FA076e",
+  "ramenDev": "0x18d7C1AD00D336C9BFC304fE828Da9fE29656c31",
+  "deploymentBlock": 52185716,
+  "deploymentTransactions": {
+    "otc": "0xcefe32a08a4091f540c56ec483cdc22cd0df1c2b7b59d0b4947f4f88024ed67a",
+    "liquidityLocker": "0x4f743535a89035c40c6aa8d5930546d4638f98712edae42271f31d54835859f4",
+    "launcher": "0xa9edf0e272755eb6a5054756701a6a9081e637bc2f0b17afad963ccddbe48c1b",
+    "ethRouter": "0xc240b3c23392424de60df51c3301bb4e8f997d0538c08a7506fb266091b87bac"
+  },
+  "uniswapV3PositionManager": "0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3",
+  "uniswapV3SwapRouter": "0xCaf681a66D020601342297493863E78C959E5cb2",
+  "uniswapV2Router": "0x89e5DB8B5aA49aA85AC63f691524311AEB649eba",
+  "weth": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+  "ramen": "0xe013e34F03F42d49E836d59CF6353B897c337777"
+}

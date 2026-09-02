@@ -1,0 +1,38 @@
+# Dependencies and generated JavaScript
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+**/coverage/
+*.tsbuildinfo
+
+# Foundry artifacts and deployment broadcasts
+out/
+cache/
+broadcast/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!**/.env.example
+secrets/
+*.pem
+*.key
+*.keystore
+
+# Vercel and local tooling
+.vercel/
+.vite/
+.eslintcache
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# Runtime data
+backend/ramenpad/uploads/
+
+.vercel
