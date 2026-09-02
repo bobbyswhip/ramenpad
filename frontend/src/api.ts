@@ -1,4 +1,5 @@
 import { io } from "socket.io-client";
+import { getAddress } from "viem";
 import { API_URL } from "./config";
 import type { LaunchQuote, MarketUpdate, ProtocolKpis, RamenpadConfig, TokenSummary, TokenUpdate, Trade } from "./types";
 
@@ -52,7 +53,7 @@ export async function uploadImage(file: File) {
 }
 
 export function tokenImageUpdateMessage(token: string, imageUrl: string, timestamp: number) {
-  return `RamenPad image update\nChain: 4663\nToken: ${token}\nImage: ${imageUrl}\nTimestamp: ${timestamp}`;
+  return `RamenPad image update\nChain: 4663\nToken: ${getAddress(token)}\nImage: ${imageUrl}\nTimestamp: ${timestamp}`;
 }
 
 export function updateTokenImage(token: string, input: { imageUrl: string; timestamp: number; signature: string }) {

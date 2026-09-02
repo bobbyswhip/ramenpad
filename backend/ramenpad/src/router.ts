@@ -28,6 +28,12 @@ function imageUpdateMessage(token: string, imageUrl: string, timestamp: number) 
   return `RamenPad image update\nChain: 4663\nToken: ${token}\nImage: ${imageUrl}\nTimestamp: ${timestamp}`;
 }
 
+export function imageUpdateMessages(token: string, imageUrl: string, timestamp: number) {
+  const checksumToken = getAddress(token);
+  return [...new Set([checksumToken, checksumToken.toLowerCase(), token])]
+    .map((address) => imageUpdateMessage(address, imageUrl, timestamp));
+}
+
 const uploadDir = path.resolve(process.cwd(), "uploads");
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({
@@ -193,7 +199,8 @@ export function createRamenpadRouter(db: Database) {
 
   router.post("/tokens/:address/image", async (request, response, next) => {
     try {
-      const token = getAddress(z.string().regex(/^0x[0-9a-fA-F]{40}$/).parse(request.params.address));
+      const tokenInput = z.string().regex(/^0x[0-9a-fA-F]{40}$/).parse(request.params.address);
+      const token = getAddress(tokenInput);
       const input = imageUpdateInput.parse(request.body);
       if (Math.abs(Date.now() - input.timestamp) > 10 * 60_000) {
         response.status(400).json({ error: "Image update signature expired" }); return;
@@ -202,11 +209,12 @@ export function createRamenpadRouter(db: Database) {
         "SELECT launcher FROM ramenpad.launches WHERE token_address=$1", [token.toLowerCase()],
       );
       if (!launch.rowCount) { response.status(404).json({ error: "Unknown RamenPad token" }); return; }
-      const signer = await recoverMessageAddress({
-        message: imageUpdateMessage(token, input.imageUrl, input.timestamp),
+      const candidateMessages = imageUpdateMessages(tokenInput, input.imageUrl, input.timestamp);
+      const signers = await Promise.all(candidateMessages.map((message) => recoverMessageAddress({
+        message,
         signature: input.signature as `0x${string}`,
-      });
-      if (signer.toLowerCase() !== launch.rows[0].launcher.toLowerCase()) {
+      })));
+      if (!signers.some((signer) => signer.toLowerCase() === launch.rows[0].launcher.toLowerCase())) {
         response.status(403).json({ error: "Only the token launcher can update its image" }); return;
       }
       await db.query(
