@@ -203,12 +203,14 @@ export class RamenpadIndexer {
 
   private schedule() {
     if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
     const delay = !this.caughtUp
       ? 5_000
       : this.consecutiveFailures
       ? Math.min(15_000 * (2 ** this.consecutiveFailures), this.maxBackoffMs)
       : this.intervalMs;
     this.timer = setTimeout(async () => {
+      this.timer = undefined;
       await this.runTick();
       this.schedule();
     }, delay);
@@ -382,6 +384,7 @@ export class RamenpadIndexer {
         await delay(2_000);
         await this.startLiveSubscriptions();
         await this.runTick();
+        this.schedule();
       })().catch((error) => {
         const name = error instanceof Error ? error.name : "Error";
         console.error(`[ramenpad:ws] reconnect failed (${name})`);
